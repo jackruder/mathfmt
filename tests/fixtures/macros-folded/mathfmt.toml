@@ -1,0 +1,8 @@
+profile = "folded"
+
+[profiles.folded]
+styled = "latex"
+
+[profiles.folded.spellings]
+"ℝ" = "\\R"
+"𝔼" = "\\E"
