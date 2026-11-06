@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/mathfmt-core", "crates/mathfmt"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+repository = "ssh://forgejo@git.buttermilks.rocks/jack/mathfmt.git"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,183 @@
+# name	args	flags
+# Hand-curated command signatures for math mode. `args` is a string of
+# argument kinds in order: m = math argument (brace group or one token),
+# t = text argument (brace group scanned in text mode: may hold $...$),
+# o = optional [...] argument (opaque), d = one delimiter token (after \left).
+# `flags`: style=<style> marks a math-alphabet command; plain marks a style
+# command that resets to the default alphabet; star means a `*` right after
+# the name belongs to it. Unknown commands take no arguments. A user
+# definition read from the source overrides a row here.
+#
+# style commands (the alphabet layer)
+mathrm	m	style=up
+mathit	m	style=it
+mathbf	m	style=bf
+mathsf	m	style=sf
+mathtt	m	style=tt
+mathcal	m	style=cal
+mathscr	m	style=scr
+mathfrak	m	style=frak
+mathbb	m	style=bb
+mathbbm	m	style=bb
+mathds	m	style=bb
+boldsymbol	m	style=bfit
+bm	m	style=bfit
+pmb	m	style=bfit
+mathnormal	m	plain
+symnormal	m	plain
+symup	m	style=up
+symit	m	style=it
+symbf	m	style=bf
+symbfup	m	style=bf
+symbfit	m	style=bfit
+symsf	m	style=sf
+symsfit	m	style=sfit
+symbfsf	m	style=bfsf
+symbfsfit	m	style=bfsfit
+symtt	m	style=tt
+symcal	m	style=cal
+symscr	m	style=scr
+symbfcal	m	style=bfcal
+symbfscr	m	style=bfscr
+symfrak	m	style=frak
+symbffrak	m	style=bffrak
+symbb	m	style=bb
+mathbfit	m	style=bfit
+mathbfup	m	style=bf
+mathsfit	m	style=sfit
+mathbfsf	m	style=bfsf
+mathbfsfit	m	style=bfsfit
+mathbfcal	m	style=bfcal
+mathbfscr	m	style=bfscr
+mathbffrak	m	style=bffrak
+# text arguments: scanned as text, never rewritten as math
+text	t	
+textrm	t	
+textit	t	
+textbf	t	
+textsf	t	
+texttt	t	
+textnormal	t	
+textup	t	
+textsc	t	
+emph	t	
+mbox	t	
+hbox	t	
+fbox	t	
+intertext	t	
+shortintertext	t	
+operatorname	t	star
+operatornamewithlimits	t	
+label	t	
+tag	t	star
+ref	t	
+eqref	t	
+pageref	t	
+cite	ot	
+citep	ot	
+citet	ot	
+footnote	t	
+color	t	
+textcolor	tm	
+colorbox	tm	
+fcolorbox	ttm	
+vspace	t	star
+hspace	t	star
+raisebox	tm	
+rule	tt	
+includegraphics	ot	
+url	t	
+href	tt	
+begin	t	
+end	t	
+mathversion	t	
+# math arguments
+frac	mm	
+dfrac	mm	
+tfrac	mm	
+cfrac	omm	
+binom	mm	
+dbinom	mm	
+tbinom	mm	
+genfrac	ttttmm	
+sqrt	om	
+overline	m	
+underline	m	
+overbrace	m	
+underbrace	m	
+overrightarrow	m	
+overleftarrow	m	
+overleftrightarrow	m	
+underrightarrow	m	
+underleftarrow	m	
+widehat	m	
+widetilde	m	
+hat	m	
+check	m	
+tilde	m	
+acute	m	
+grave	m	
+dot	m	
+ddot	m	
+dddot	m	
+ddddot	m	
+breve	m	
+bar	m	
+vec	m	
+stackrel	mm	
+overset	mm	
+underset	mm	
+sideset	mmm	
+xrightarrow	om	
+xleftarrow	om	
+substack	m	
+mathop	m	
+mathbin	m	
+mathrel	m	
+mathord	m	
+mathopen	m	
+mathclose	m	
+mathpunct	m	
+mathinner	m	
+phantom	m	
+hphantom	m	
+vphantom	m	
+smash	m	
+boxed	m	
+pmod	m	
+pod	m	
+not	d	
+left	d	
+right	d	
+middle	d	
+big	d	
+Big	d	
+bigg	d	
+Bigg	d	
+bigl	d	
+bigr	d	
+bigm	d	
+Bigl	d	
+Bigr	d	
+Bigm	d	
+biggl	d	
+biggr	d	
+biggm	d	
+Biggl	d	
+Biggr	d	
+Biggm	d	
+ensuremath	m	
+mathclap	m	
+mathllap	m	
+mathrlap	m	
+mathstrut		
+displaystyle		
+textstyle		
+scriptstyle		
+scriptscriptstyle		
+limits		
+nolimits		
+quad		
+qquad		
+nonumber		
+notag		

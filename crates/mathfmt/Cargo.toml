@@ -1,0 +1,21 @@
+[package]
+name = "mathfmt"
+description = "A filter that enforces math-notation conventions in LaTeX source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mathfmt"
+path = "src/main.rs"
+
+[dependencies]
+mathfmt-core = { path = "../mathfmt-core" }
+clap = { version = "4", features = ["derive", "wrap_help"] }
+rayon = "1"
+similar = "2"
+anyhow = "1"
+serde_json = { workspace = true }
+[dev-dependencies]
+serde_json = { workspace = true }

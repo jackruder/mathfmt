@@ -1,0 +1,8 @@
+/target
+/result
+/result-*
+*.pdf
+*.aux
+*.log
+/tests/fixtures/**/actual.tex
+.direnv/
