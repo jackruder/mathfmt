@@ -1,0 +1,29 @@
+# Use this repository as a pre-commit hook:
+#
+#   repos:
+#     - repo: ssh://forgejo@git.buttermilks.rocks/jack/mathfmt.git
+#       rev: v0.1.0
+#       hooks:
+#         - id: mathfmt          # rewrites staged .tex/.sty files to the profile
+#         # - id: mathfmt-check  # or: fail the commit, change nothing
+#
+# `language: rust` builds the binary with cargo on first use. An installed
+# binary on PATH works the same way with `language: system` in your own
+# .pre-commit-config.yaml.
+- id: mathfmt
+  name: mathfmt
+  description: enforce math-notation conventions in LaTeX source
+  entry: mathfmt
+  language: rust
+  args: ["--write"]
+  files: \.(tex|sty)$
+  pass_filenames: true
+
+- id: mathfmt-check
+  name: mathfmt (check)
+  description: fail when math notation does not match the profile; change nothing
+  entry: mathfmt
+  language: rust
+  args: ["--check"]
+  files: \.(tex|sty)$
+  pass_filenames: true
