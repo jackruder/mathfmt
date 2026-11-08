@@ -374,7 +374,7 @@ fn starts_alphabetic(s: &str) -> bool {
 
 /// Is the text before an occurrence a `^` or `_` (spaces allowed), so the
 /// occurrence is the operand of a script?
-fn is_script_operand(before: &str) -> bool {
+pub(crate) fn is_script_operand(before: &str) -> bool {
     let trimmed = before.trim_end_matches([' ', '\t']);
     trimmed.ends_with('^') || trimmed.ends_with('_')
 }
@@ -382,7 +382,7 @@ fn is_script_operand(before: &str) -> bool {
 /// A script operand that is a multi-byte character (pdflatex reads it a byte
 /// at a time) or a command with an argument (`x_\boldsymbol{\theta}` is
 /// "Missing { inserted") needs braces; a bare control word or ASCII does not.
-fn needs_script_braces(text: &str) -> bool {
+pub(crate) fn needs_script_braces(text: &str) -> bool {
     !text.starts_with('{') && (!text.is_ascii() || text.contains('{'))
 }
 
@@ -400,7 +400,7 @@ mod tests {
         let sigs = Signatures::builtin();
         let doc = scan(src, &sigs, &ScanOptions::default(), &MacroTable::new());
         let profile = Config::default().profile(profile).unwrap();
-        let (occ, mut diags) = resolve(&doc, src, &table, &sigs, &profile);
+        let (occ, _, mut diags) = resolve(&doc, src, &table, &sigs, &profile, &[]);
         let (edits, more) = plan(src, &occ, &profile, &table, &RenameMap::new());
         diags.extend(more);
         (apply(src, &edits), diags)

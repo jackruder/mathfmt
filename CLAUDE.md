@@ -14,7 +14,9 @@ work in the repository. It is loaded by every seat of the mathfmt rig
   event, a paragraph per task copied from its report). `docs/REVIEW-*.md`: a
   wave's adversarial review.
 - `crates/mathfmt-core/`: the library, one module per pipeline stage (scan,
-  lex, parse, macros, resolve, profile, print, config, diag). `src/main.rs`:
+  lex, parse, macros, notation, resolve, profile, print, config, diag).
+  `notation.rs` holds the pattern matcher and the rewrite for notations with
+  holes (`[notations]` in the config). `src/main.rs`:
   the CLI, thin; it is the root package so that pre-commit's
   `cargo install --path .` works.
 - `crates/mathfmt-core/data/`: the tables. `unicode-math.tsv` and

@@ -12,6 +12,7 @@ pub mod config;
 pub mod diag;
 pub mod lex;
 pub mod macros;
+pub mod notation;
 pub mod parse;
 pub mod print;
 pub mod resolve;
@@ -27,6 +28,7 @@ pub use config::{Config, ConfigError, Form, Profile};
 pub use diag::{Diagnostic, Level, LineIndex};
 pub use lex::Span;
 pub use macros::{Macro, MacroTable};
+pub use notation::NotationOccurrence;
 pub use parse::{scan, Document, MathRegion, Node, RegionKind, ScanOptions};
 pub use print::{Edit, RenameMap};
 pub use resolve::{OccKind, Occurrence, Part};
@@ -66,8 +68,18 @@ pub struct Outcome {
     pub changed: bool,
     pub edits: Vec<Edit>,
     pub occurrences: Vec<Occurrence>,
+    /// The notations recognized, rewritten or not.
+    pub notations: Vec<NotationOccurrence>,
     pub document: Document,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// One notation in a file, with how often and in which forms: the inventory.
+#[derive(Debug, Clone)]
+pub struct NotationCount {
+    pub name: String,
+    pub count: usize,
+    pub forms: BTreeMap<String, usize>,
 }
 
 /// One distinct atom in a file, with how it was spelled: the inventory.
@@ -151,11 +163,40 @@ impl Engine {
     pub fn convert(&self, src: &str, profile: &Profile, rename: &RenameMap) -> Outcome {
         let document = scan(src, &self.signatures, &self.scan_options, &self.macros);
         let mut diagnostics = document.diagnostics.clone();
-        let (occurrences, more) =
-            resolve::resolve(&document, src, &self.table, &self.signatures, profile);
+        let decls = self.config.notation_decls();
+        let notations = notation::parse_notations(&decls, &self.signatures, &document.macros);
+        let (occurrences, matches, more) = resolve::resolve(
+            &document,
+            src,
+            &self.table,
+            &self.signatures,
+            profile,
+            &notations,
+        );
         diagnostics.extend(more);
         let (edits, more) = print::plan(src, &occurrences, profile, &self.table, rename);
         diagnostics.extend(more);
+        let edits = if matches.is_empty() {
+            edits
+        } else {
+            let convert =
+                |fragment: &str| self.convert_fragment(fragment, &document.macros, profile, rename);
+            notation::rewrite(src, edits, &matches, &notations, profile, &convert)
+        };
+        let records: Vec<NotationOccurrence> = matches
+            .iter()
+            .map(|m| {
+                let n = &notations[m.notation];
+                NotationOccurrence {
+                    name: n.name.clone(),
+                    form: n.forms[m.form].name.clone(),
+                    span: m.span,
+                    holes: m.holes.iter().map(|b| b.span).collect(),
+                    rewritten: profile.notations.contains_key(&n.name),
+                }
+            })
+            .collect();
+        drop(matches);
         let output = print::apply(src, &edits);
         diagnostics.sort_by_key(|d| d.offset);
         Outcome {
@@ -163,16 +204,60 @@ impl Engine {
             output,
             edits,
             occurrences,
+            notations: records,
             document,
             diagnostics,
         }
     }
 
+    /// Convert a rendered notation form (math only, no notations) so its
+    /// literals come out in the profile's spellings.
+    fn convert_fragment(
+        &self,
+        text: &str,
+        macros: &MacroTable,
+        profile: &Profile,
+        rename: &RenameMap,
+    ) -> String {
+        let (nodes, _) = parse::parse_math_str(text, &self.signatures, macros);
+        let doc = Document {
+            regions: vec![MathRegion {
+                kind: RegionKind::Inline,
+                open: Span::new(0, 0),
+                close: None,
+                nodes,
+            }],
+            macros: macros.clone(),
+            diagnostics: Vec::new(),
+        };
+        let (occurrences, _, _) =
+            resolve::resolve(&doc, text, &self.table, &self.signatures, profile, &[]);
+        let (edits, _) = print::plan(text, &occurrences, profile, &self.table, rename);
+        print::apply(text, &edits)
+    }
+
+    /// The notation inventory of one file: each notation, how often, in
+    /// which forms.
+    pub fn notation_inventory(&self, src: &str, profile: &Profile) -> Vec<NotationCount> {
+        let outcome = self.convert(src, profile, &RenameMap::new());
+        let mut map: BTreeMap<String, NotationCount> = BTreeMap::new();
+        for n in &outcome.notations {
+            let entry = map.entry(n.name.clone()).or_insert_with(|| NotationCount {
+                name: n.name.clone(),
+                count: 0,
+                forms: BTreeMap::new(),
+            });
+            entry.count += 1;
+            *entry.forms.entry(n.form.clone()).or_insert(0) += 1;
+        }
+        map.into_values().collect()
+    }
+
     /// The notation inventory of one file: each atom, how often, spelled how.
     pub fn inventory(&self, src: &str, profile: &Profile) -> Vec<SymbolCount> {
         let document = scan(src, &self.signatures, &self.scan_options, &self.macros);
-        let (occurrences, _) =
-            resolve::resolve(&document, src, &self.table, &self.signatures, profile);
+        let (occurrences, _, _) =
+            resolve::resolve(&document, src, &self.table, &self.signatures, profile, &[]);
         let mut map: BTreeMap<Atom, SymbolCount> = BTreeMap::new();
         for occ in &occurrences {
             let spelling = occ.span.text(src).to_string();
@@ -200,8 +285,8 @@ impl Engine {
     pub fn parse_atom(&self, spelling: &str, profile: &Profile) -> Result<Atom, Error> {
         let src = format!("${spelling}$");
         let document = scan(&src, &self.signatures, &self.scan_options, &self.macros);
-        let (occurrences, _) =
-            resolve::resolve(&document, &src, &self.table, &self.signatures, profile);
+        let (occurrences, _, _) =
+            resolve::resolve(&document, &src, &self.table, &self.signatures, profile, &[]);
         let atoms: Vec<Atom> = occurrences.into_iter().flat_map(|o| o.atoms).collect();
         match atoms.as_slice() {
             [a] => Ok(*a),
@@ -230,6 +315,76 @@ mod tests {
         );
         let back = engine.convert(&a.output, &unicode, &RenameMap::new());
         assert_eq!(back.output, u.output);
+    }
+
+    #[test]
+    fn notations_rewrite_both_ways_and_nest() {
+        let config = Config::parse(
+            r#"
+            [notations.KL]
+            macro = "\\KL{#1}{#2}"
+            expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+            [notations.N]
+            macro = "\\N(#1, #2)"
+            expanded = "\\mathcal{N}(#1, #2)"
+            [profiles.ascii.notations]
+            KL = "macro"
+            N = "macro"
+            [profiles.unicode.notations]
+            KL = "expanded"
+            N = "expanded"
+            "#,
+            None,
+        )
+        .unwrap();
+        let engine = Engine::new(config).unwrap();
+        let ascii = engine.profile(Some("ascii")).unwrap();
+        let unicode = engine.profile(Some("unicode")).unwrap();
+        let defs = "\\newcommand{\\KL}[2]{D_{\\mathrm{KL}}(#1 \\| #2)}\\newcommand{\\N}[2]{\\mathcal{N}(#1, #2)}\n";
+        let src = format!(
+            "{defs}$D_{{\\mathrm{{KL}}}}(\\mathcal{{N}}(\\mu, \\Sigma) ‖ q_\\phi) \\le \\alpha\\KL{{p}}{{q}}$"
+        );
+        let a = engine.convert(&src, &ascii, &RenameMap::new());
+        assert_eq!(
+            a.output,
+            format!("{defs}$\\KL{{\\N(\\mu, \\Sigma)}}{{q_\\phi}} \\leq \\alpha\\KL{{p}}{{q}}$"),
+            "to the macro forms, nested, with the inner hole converted"
+        );
+        assert_eq!(a.notations.len(), 3);
+        assert!(a.notations.iter().all(|n| n.rewritten));
+        let u = engine.convert(&src, &unicode, &RenameMap::new());
+        assert_eq!(
+            u.output,
+            format!("{defs}$D_{{\\mathrm{{KL}}}}(𝒩(μ, Σ) ‖ q_{{ϕ}}) ≤ α D_{{\\mathrm{{KL}}}}(p ‖ q)$"),
+            "to the expanded forms, the form's own \\| in the profile's spelling, a space after \\alpha"
+        );
+        for (out, p) in [(&a.output, &ascii), (&u.output, &unicode)] {
+            let again = engine.convert(out, p, &RenameMap::new());
+            assert_eq!(&again.output, out, "idempotent under {}", p.name);
+        }
+        let braced = engine.convert(
+            &format!("{defs}$\\underbrace{{\\KL{{p}}{{q}}}}_{{x}} + {{\\KL{{p}}{{q}}}}$"),
+            &unicode,
+            &RenameMap::new(),
+        );
+        assert_eq!(
+            braced.output,
+            format!("{defs}$\\underbrace{{D_{{\\mathrm{{KL}}}}(p ‖ q)}}_{{x}} + {{D_{{\\mathrm{{KL}}}}(p ‖ q)}}$"),
+            "a notation inside braces keeps them"
+        );
+        // A profile with no choice leaves the form alone but still sees it.
+        let plain = Engine::new(Config::parse(
+            "[notations.KL]\nmacro = \"\\\\KL{#1}{#2}\"\nexpanded = \"D_{\\\\mathrm{KL}}(#1 \\\\| #2)\"",
+            None,
+        )
+        .unwrap())
+        .unwrap();
+        let p = plain.profile(Some("unicode")).unwrap();
+        let o = plain.convert(r"$D_{\mathrm{KL}}(p \| q)$", &p, &RenameMap::new());
+        assert_eq!(o.output, "$D_{\\mathrm{KL}}(p ‖ q)$");
+        assert_eq!((o.notations.len(), o.notations[0].rewritten), (1, false));
+        let inv = plain.notation_inventory(r"$D_{\mathrm{KL}}(p \| q) + \KL{a}{b}$", &p);
+        assert_eq!((inv[0].count, inv[0].forms.len()), (2, 2));
     }
 
     #[test]

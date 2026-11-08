@@ -41,6 +41,9 @@ pub struct ProfileConfig {
     pub style_commands: BTreeMap<String, String>,
     #[serde(default)]
     pub spellings: BTreeMap<String, String>,
+    /// notation name → the form this profile writes it in.
+    #[serde(default)]
+    pub notations: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -69,6 +72,10 @@ pub struct Config {
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default)]
     pub symbols: BTreeMap<String, SymbolDecl>,
+    /// notation name → form name → pattern with `#n` holes. Every form is
+    /// recognized on input; a profile's `notations` picks the one it writes.
+    #[serde(default)]
+    pub notations: BTreeMap<String, BTreeMap<String, String>>,
     /// Where the file was found; `macros` paths are relative to it.
     #[serde(skip)]
     pub dir: Option<PathBuf>,
@@ -93,6 +100,7 @@ impl Default for Config {
             text_commands: Vec::new(),
             profiles: BTreeMap::new(),
             symbols: BTreeMap::new(),
+            notations: BTreeMap::new(),
             dir: None,
         }
     }
@@ -111,6 +119,9 @@ pub struct Profile {
     pub style_commands: HashMap<String, String>,
     /// atom key or character → spelling.
     pub spellings: HashMap<String, String>,
+    /// notation name → the pattern of the form this profile writes. A
+    /// notation absent here is recognized but left in whatever form it has.
+    pub notations: HashMap<String, String>,
 }
 
 const DEFAULT_STYLE_COMMANDS: &[(&str, &str)] = &[
@@ -187,8 +198,53 @@ impl Config {
                     )));
                 }
             }
+            for (nname, fname) in &p.notations {
+                let Some(forms) = self.notations.get(nname) else {
+                    return Err(ConfigError(format!(
+                        "profiles.{name}.notations: no notation named `{nname}`"
+                    )));
+                };
+                if !forms.contains_key(fname) {
+                    return Err(ConfigError(format!(
+                        "profiles.{name}.notations.{nname}: no form named `{fname}`; known: {}",
+                        forms.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+            }
+        }
+        for (nname, forms) in &self.notations {
+            if forms.is_empty() {
+                return Err(ConfigError(format!("notations.{nname} has no forms")));
+            }
+            let mut holes: Option<usize> = None;
+            for (fname, pattern) in forms {
+                let n = crate::notation::check_pattern(pattern)
+                    .map_err(|e| ConfigError(format!("notations.{nname}.{fname}: {e}")))?;
+                match holes {
+                    None => holes = Some(n),
+                    Some(h) if h != n => {
+                        return Err(ConfigError(format!(
+                        "notations.{nname}: form `{fname}` has {n} holes where the others have {h}"
+                    )))
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The notations as the matcher wants them: name, then (form, pattern).
+    pub fn notation_decls(&self) -> Vec<(String, Vec<(String, String)>)> {
+        self.notations
+            .iter()
+            .map(|(n, forms)| {
+                (
+                    n.clone(),
+                    forms.iter().map(|(f, p)| (f.clone(), p.clone())).collect(),
+                )
+            })
+            .collect()
     }
 
     /// Resolve a profile by name, with the built-in `unicode` and `ascii` as
@@ -228,6 +284,16 @@ impl Config {
             },
             style_commands,
             spellings: user.spellings.into_iter().collect(),
+            notations: user
+                .notations
+                .iter()
+                .filter_map(|(n, f)| {
+                    self.notations
+                        .get(n)
+                        .and_then(|forms| forms.get(f))
+                        .map(|p| (n.clone(), p.clone()))
+                })
+                .collect(),
         })
     }
 
@@ -283,6 +349,33 @@ mod tests {
         let a = c.profile("ascii").unwrap();
         assert_eq!((a.symbols, a.greek), (Form::Latex, Form::Unicode));
         assert_eq!(c.default_profile_name(), "mike");
+    }
+
+    #[test]
+    fn notations_are_validated_and_resolved_per_profile() {
+        let c = Config::parse(
+            r#"
+            [notations.KL]
+            macro = "\\KL{#1}{#2}"
+            expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+            [profiles.ascii.notations]
+            KL = "macro"
+            "#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(c.profile("ascii").unwrap().notations["KL"], "\\KL{#1}{#2}");
+        assert!(c.profile("unicode").unwrap().notations.is_empty());
+        assert_eq!(c.notation_decls()[0].1.len(), 2);
+        for bad in [
+            "[notations.KL]\nmacro = \"\\\\KL{#1}{#3}\"",
+            "[notations.KL]\na = \"\\\\KL{#1}{#2}\"\nb = \"\\\\KL{#1}\"",
+            "[notations.KL]\na = \"#1 #2\"",
+            "[profiles.ascii.notations]\nKL = \"macro\"",
+            "[notations.KL]\nmacro = \"\\\\KL{#1}{#2}\"\n[profiles.ascii.notations]\nKL = \"short\"",
+        ] {
+            assert!(Config::parse(bad, None).is_err(), "{bad}");
+        }
     }
 
     #[test]

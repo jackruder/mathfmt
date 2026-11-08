@@ -461,6 +461,14 @@ fn emit(kind: Emit, engine: &Engine, profile: &Profile, input: &Input) -> Result
                     "spellings": s.spellings,
                 }));
             }
+            for n in engine.notation_inventory(src, profile) {
+                line(serde_json::json!({
+                    "file": label,
+                    "notation": n.name,
+                    "count": n.count,
+                    "forms": n.forms,
+                }));
+            }
         }
         Emit::Atoms => {
             let outcome = engine.convert(src, profile, &RenameMap::new());
@@ -472,6 +480,19 @@ fn emit(kind: Emit, engine: &Engine, profile: &Profile, input: &Input) -> Result
                     "source": o.span.text(src),
                     "kind": format!("{:?}", o.kind).to_lowercase(),
                     "atoms": o.atoms.iter().map(|a| atom_json(engine, a)).collect::<Vec<_>>(),
+                }));
+            }
+            for n in &outcome.notations {
+                line(serde_json::json!({
+                    "file": label,
+                    "start": position(&index, n.span.start),
+                    "end": position(&index, n.span.end),
+                    "source": n.span.text(src),
+                    "kind": "notation",
+                    "notation": n.name,
+                    "form": n.form,
+                    "holes": n.holes.iter().map(|h| h.text(src)).collect::<Vec<_>>(),
+                    "rewritten": n.rewritten,
                 }));
             }
         }

@@ -1,0 +1,9 @@
+profile = "ascii"
+
+[notations.KL]
+macro = "\\KL{#1}{#2}"
+expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+spaced = "D_{\\mathrm{KL}}(#1 \\,\\|\\, #2)"
+
+[profiles.ascii.notations]
+KL = "macro"

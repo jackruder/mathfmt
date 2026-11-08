@@ -96,8 +96,10 @@ differs: main.tex: 1 of 8 pages
 
 because unicode-math-input reads `𝟙` as `\mathbb{1}`, which in amsfonts is the
 glyph ⊮, where the paper wrote `\mathbbm{1}`; one
-`\umiDeclareMathChar{𝟙}{\mathbbm{1}}` in the preamble closes it. Every other
-page of the paper renders identically.
+`\umiDeclareMathChar{𝟙}{\mathbbm{1}}` in the preamble closes it. With that
+line, and the paper's five `\KL{p}{q}` calls rewritten to their expanded form
+through a notation declaration, the verdict is
+`verified: main.tex (14 pages identical)`, in about two seconds.
 
 A FILE without `\documentclass` is a snippet and is wrapped in a preamble
 (`--preamble FILE`, or a built-in one that loads the usual packages and
@@ -108,6 +110,33 @@ what the `ascii` profile spells them as). `--verify` needs the engine and
 A project's `mathfmt.toml` names the definition files whose macros the tool
 reads and the profiles it may emit; two profiles, `unicode` and `ascii`, exist
 with defaults even when the file does not mention them.
+
+### Notations with arguments
+
+A symbol with parameters has spellings too. Declare the notation once, with
+every form the project has ever written, and let each profile pick the one it
+emits:
+
+```toml
+[notations.KL]
+macro    = "\\KL{#1}{#2}"
+expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+spaced   = "D_{\\mathrm{KL}}(#1 \\,\\|\\, #2)"
+
+[profiles.ascii.notations]
+KL = "macro"            # D_{\mathrm{KL}}(p \| q)  →  \KL{p}{q}
+[profiles.unicode.notations]
+KL = "expanded"         # \KL{p}{q}  →  D_{\mathrm{KL}}(p ‖ q)
+```
+
+Matching is on the math tree modulo symbols, so `\|`, `\Vert` and `‖` are one
+thing, `D_\mathrm{KL}` is `D_{\mathrm{KL}}`, and the holes bind whatever sits
+between the literals: `D_{\mathrm{KL}}(\mathcal{N}(\mu,\Sigma) ‖ q_\phi)`
+becomes `\KL{\mathcal{N}(\mu, \Sigma)}{q_\phi}`, with the holes converted and
+nested notations handled inside them. The form a profile writes goes through
+the profile's symbol spellings too, so one form serves both. A profile that
+names no form leaves the notation as written; `--emit symbols` still counts
+it, form by form.
 
 ## What it does to a real paper
 

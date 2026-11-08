@@ -5,6 +5,7 @@ use crate::config::Profile;
 use crate::diag::Diagnostic;
 use crate::lex::{Span, TokKind, Token};
 use crate::macros::{substitute, Macro, MacroKind, MacroTable};
+use crate::notation::{Match, Matcher, Notation};
 use crate::parse::{parse_math_str, Arg, Command, Document, Node};
 use crate::signatures::Signatures;
 use crate::table::Table;
@@ -58,13 +59,16 @@ fn push_text(parts: &mut Vec<Part>, text: &str) {
     }
 }
 
-pub fn resolve(
-    doc: &Document,
-    src: &str,
-    table: &Table,
-    sigs: &Signatures,
-    profile: &Profile,
-) -> (Vec<Occurrence>, Vec<Diagnostic>) {
+/// Resolve a document: its atom occurrences, its notation matches (borrowing
+/// the tree) and the diagnostics.
+pub fn resolve<'d>(
+    doc: &'d Document,
+    src: &'d str,
+    table: &'d Table,
+    sigs: &'d Signatures,
+    profile: &'d Profile,
+    notations: &'d [Notation],
+) -> (Vec<Occurrence>, Vec<Match<'d>>, Vec<Diagnostic>) {
     let mut r = Resolver {
         src,
         table,
@@ -73,16 +77,23 @@ pub fn resolve(
         profile,
         depth: 0,
         diags: Vec::new(),
+        notations,
+        matcher: Matcher {
+            table,
+            doc_src: src,
+        },
+        matches: Vec::new(),
     };
     let mut out = Vec::new();
     for region in &doc.regions {
         r.walk(&region.nodes, &mut out);
     }
     out.sort_by_key(|o| o.span.start);
-    (out, r.diags)
+    r.matches.sort_by_key(|m| m.span.start);
+    (out, r.matches, r.diags)
 }
 
-struct Resolver<'a> {
+struct Resolver<'a, 'n> {
     src: &'a str,
     table: &'a Table,
     sigs: &'a Signatures,
@@ -90,15 +101,45 @@ struct Resolver<'a> {
     profile: &'a Profile,
     depth: usize,
     diags: Vec<Diagnostic>,
+    /// Empty inside a macro expansion, whose spans are not the document's.
+    notations: &'a [Notation],
+    matcher: Matcher<'a>,
+    matches: Vec<Match<'n>>,
 }
 
-impl<'a> Resolver<'a> {
+impl<'a, 'n> Resolver<'a, 'n> {
     /// Walk nodes, pushing occurrences. Returns true when every non-trivia node
     /// was accounted for by an occurrence: the test for inlining a macro.
-    fn walk(&mut self, nodes: &[Node], out: &mut Vec<Occurrence>) -> bool {
+    fn walk(&mut self, nodes: &'n [Node], out: &mut Vec<Occurrence>) -> bool {
         let mut complete = true;
-        for node in nodes {
-            match node {
+        let mut i = 0;
+        while i < nodes.len() {
+            // Try the notations at a real node only: trying at the space
+            // before one would find the same match twice.
+            let trivia = matches!(&nodes[i], Node::Leaf(t) if t.kind == TokKind::Trivia);
+            if !self.notations.is_empty() && !trivia {
+                if let Some(m) = self.matcher.match_at(self.notations, nodes, i) {
+                    let rewritten = self
+                        .profile
+                        .notations
+                        .contains_key(&self.notations[m.notation].name);
+                    if rewritten {
+                        // The form supplies the literal parts; only the holes
+                        // are ours to convert, and nested notations in them.
+                        for hole in &m.holes {
+                            self.walk(hole.nodes, out);
+                        }
+                        i += m.consumed;
+                        complete = false;
+                        self.matches.push(m);
+                        continue;
+                    }
+                    // Recognized but kept as written: recorded, then walked
+                    // like anything else.
+                    self.matches.push(m);
+                }
+            }
+            match &nodes[i] {
                 Node::Leaf(t) => complete &= self.leaf(t, out),
                 Node::Group(g) => {
                     // A group is transparent; its atoms are its children's.
@@ -106,6 +147,7 @@ impl<'a> Resolver<'a> {
                 }
                 Node::Command(c) => complete &= self.command(c, out),
             }
+            i += 1;
         }
         complete
     }
@@ -165,7 +207,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn command(&mut self, c: &Command, out: &mut Vec<Occurrence>) -> bool {
+    fn command(&mut self, c: &'n Command, out: &mut Vec<Occurrence>) -> bool {
         let name = c.name.name(self.src);
         if let Some(m) = self.macros.get(name) {
             return self.macro_call(c, m, out);
@@ -234,7 +276,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn styled_group(&mut self, c: &Command, style: Style, out: &mut Vec<Occurrence>) -> bool {
+    fn styled_group(&mut self, c: &'n Command, style: Style, out: &mut Vec<Occurrence>) -> bool {
         let Some(Arg::Math(arg)) = c.args.first() else {
             return false;
         };
@@ -337,7 +379,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn macro_call(&mut self, c: &Command, m: &Macro, out: &mut Vec<Occurrence>) -> bool {
+    fn macro_call(&mut self, c: &'n Command, m: &Macro, out: &mut Vec<Occurrence>) -> bool {
         if m.kind == MacroKind::Operator {
             return false;
         }
@@ -395,6 +437,12 @@ impl<'a> Resolver<'a> {
             profile: self.profile,
             depth: self.depth + 1,
             diags: Vec::new(),
+            notations: &[],
+            matcher: Matcher {
+                table: self.table,
+                doc_src: &expansion,
+            },
+            matches: Vec::new(),
         };
         let mut inner = Vec::new();
         let complete = sub.walk(&nodes, &mut inner);
@@ -457,7 +505,7 @@ mod tests {
         let sigs = Signatures::builtin();
         let doc = scan(src, &sigs, &ScanOptions::default(), &MacroTable::new());
         let profile = Config::default().profile("unicode").unwrap();
-        let (occ, diags) = resolve(&doc, src, &table, &sigs, &profile);
+        let (occ, _, diags) = resolve(&doc, src, &table, &sigs, &profile, &[]);
         (occ, diags, src.to_string())
     }
 

@@ -645,3 +645,68 @@ Fifteen findings; all accepted.
   `ascii` profile is not faithful there; the `\sym…` commands are. A profile
   for unicode-math is configuration today (`style_commands`), a built-in
   preset later.
+
+### 2026-11-08, parameterized notations (§13.1 shipped)
+
+- **§3, notations.** A notation is a named symbol with parameters, and its
+  forms are its spellings, as an atom's spellings are an atom's. The config
+  declares them:
+
+  ```toml
+  [notations.KL]
+  macro    = "\\KL{#1}{#2}"
+  expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+  spaced   = "D_{\\mathrm{KL}}(#1 \\,\\|\\, #2)"
+
+  [profiles.ascii.notations]
+  KL = "macro"
+  [profiles.unicode.notations]
+  KL = "expanded"
+  ```
+
+  Every form is recognized on input. A profile's `notations` names the form
+  it writes; a profile that names none leaves the notation as written but
+  still sees it (the inventory counts it, `--emit atoms` lists it with
+  `rewritten: false`). Validation: holes are `#1`…`#n` without gaps, two
+  holes never stand next to each other (the split would be ambiguous), every
+  form of a notation has the same holes, and a profile's choice names a form
+  that exists.
+- **§8, matching.** Forms are parsed as math with the document's own
+  definitions, so `\KL{#1}{#2}` has the shape a `\KL{p}{q}` call has whether
+  or not `\KL` is defined. Matching is tree matching modulo atoms: a leaf
+  matches a leaf that stands for the same atom (`\|` and `‖`, `\le` and
+  `≤`), else the same text; a command matches a command of the same name,
+  star and arity with matching arguments; a group matches a group with
+  matching children, and a group of one matches that one node. A hole binds
+  the shortest run of nodes that lets the rest of the pattern match; a hole
+  that fills a group (`{#1}`) binds the group's contents; a hole at the end
+  of a pattern binds the rest of its group, or one node at the top level. A
+  repeated hole must bind the same text. At a match's first node a pattern
+  node that is not a group never matches a document group by looking inside
+  it: the match would cover braces the rewrite does not reproduce
+  (`\underbrace{\KL{p}{q}}` lost its braces on the paper before `--verify`
+  caught it); the walker descends into the group and matches there. Forms
+  are tried most specific first
+  (most tokens), then notations in config order; the first match wins. The
+  resolver tries the notations at every position of every region before the
+  atom rules; the literal parts of a rewritten match are the form's and are
+  not converted, the holes are walked (atoms, and nested notations). Inside a
+  macro expansion no notation is matched: its spans are not the document's.
+- **§9, rewriting.** The profile's form is filled with the holes' converted
+  text (inner matches first, so an outer hole already holds its nested
+  rewrites), a hole after `^` or `_` is braced unless it is one ASCII token,
+  the spacing rule applies at every seam, and the result is run through the
+  profile's atom spellings once more, so a form's own literals come out in
+  the profile's spelling (`\|` → `‖` under `unicode`) and one form serves
+  every profile. The edits the match covers are consumed by it. A rewrite is
+  idempotent because the output is itself one of the recognized forms.
+- **§11.** `--emit symbols` adds one line per notation (`notation`, `count`,
+  `forms`); `--emit atoms` adds one per match (`kind: "notation"`, `form`,
+  `holes`, `rewritten`).
+- **§14.** Fixtures `notation-to-macro`, `notation-to-expanded` and
+  `notation-spaced-form`; the last is marked `differs` because unifying
+  `D_{\mathrm{KL}}(p \,\|\, q)` with `\KL{p}{q}` drops the thin spaces, which
+  is what a notation with several forms is for.
+- **Not yet.** Holes inside optional arguments or `\text{}` (those compare as
+  text); a form whose macro has an optional argument; notation renames; the
+  object layer (`[symbols]`) over notations.
