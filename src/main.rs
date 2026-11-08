@@ -65,8 +65,8 @@ struct RunArgs {
     /// An extra file to read macro definitions from (repeatable)
     #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
     macros: Vec<PathBuf>,
-    /// Rewrite FILEs in place
-    #[arg(short, long, conflicts_with_all = ["check", "emit"])]
+    /// Rewrite FILEs in place (through a symlink to its target)
+    #[arg(short, long, requires = "files", conflicts_with_all = ["check", "diff", "emit"])]
     write: bool,
     /// Exit 1 if any file would change, and name it; write nothing
     #[arg(long)]
@@ -80,7 +80,7 @@ struct RunArgs {
     /// Diagnostics format
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
-    /// Warnings make the exit status 1
+    /// Warnings make the exit status 1 (counted even under --quiet)
     #[arg(long)]
     strict: bool,
     /// Files to convert in parallel (default: available cores)
@@ -145,21 +145,19 @@ struct Converted {
     outcome: Outcome,
 }
 
-fn load_config(explicit: Option<&Path>, near: &Path) -> Result<Config> {
-    match explicit {
-        Some(p) => Ok(Config::load(p)?),
-        None => match Config::find(near) {
-            Some(p) => Ok(Config::load(&p)?),
-            None => Ok(Config::default()),
-        },
-    }
-}
-
-fn config_key(explicit: Option<&Path>, near: &Path) -> Option<PathBuf> {
-    match explicit {
+/// The config that governs a file: the one named on the command line, else
+/// the nearest `mathfmt.toml` at or above `near`, else the defaults. The key
+/// identifies the file (None for the defaults) so inputs can share an engine.
+fn locate_config(explicit: Option<&Path>, near: &Path) -> Result<(Option<PathBuf>, Config)> {
+    let path = match explicit {
         Some(p) => Some(p.to_path_buf()),
         None => Config::find(near),
-    }
+    };
+    let config = match &path {
+        Some(p) => Config::load(p)?,
+        None => Config::default(),
+    };
+    Ok((path, config))
 }
 
 fn build_engine(config: Config, macros: &[PathBuf]) -> Result<Engine> {
@@ -201,6 +199,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
     };
 
     // One engine per distinct config file (the nearest mathfmt.toml per file).
+    let mut configs: BTreeMap<Option<PathBuf>, Config> = BTreeMap::new();
     let mut groups: BTreeMap<Option<PathBuf>, Vec<usize>> = BTreeMap::new();
     for (i, input) in inputs.iter().enumerate() {
         let near = input
@@ -215,20 +214,15 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
                 }
             })
             .unwrap_or_else(|| cwd.clone());
-        groups
-            .entry(config_key(args.config.as_deref(), &near))
-            .or_default()
-            .push(i);
+        let (key, config) = locate_config(args.config.as_deref(), &near)?;
+        configs.entry(key.clone()).or_insert(config);
+        groups.entry(key).or_default().push(i);
     }
 
     let mut converted: Vec<Option<Converted>> = (0..inputs.len()).map(|_| None).collect();
+    let mut emitted: Vec<Option<String>> = (0..inputs.len()).map(|_| None).collect();
     for (key, indices) in groups {
-        let near = key
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cwd.clone());
-        let config = load_config(args.config.as_deref(), &near)?;
+        let config = configs.remove(&key).expect("a config per group");
         let engine = build_engine(config, &args.macros)?;
         let profile: Profile = engine.profile(args.profile.as_deref())?;
         let rename_map = match &rename {
@@ -244,7 +238,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
         };
         if let Some(kind) = args.emit {
             for &i in &indices {
-                emit(kind, &engine, &profile, &inputs[i])?;
+                emitted[i] = Some(emit(kind, &engine, &profile, &inputs[i])?);
             }
             continue;
         }
@@ -260,11 +254,16 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
             converted[i] = Some(c);
         }
     }
+
+    let mut stdout = io::stdout().lock();
     if args.emit.is_some() {
+        for text in emitted.into_iter().flatten() {
+            stdout.write_all(text.as_bytes())?;
+        }
+        stdout.flush()?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut stdout = io::stdout().lock();
     let mut any_changed = false;
     let mut any_warning = false;
     for c in converted.into_iter().flatten() {
@@ -272,14 +271,16 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
         let index = LineIndex::new(&input.text);
         let label = input.label();
         let file = input.path.as_ref().map(|_| label.as_str());
+        any_warning |= outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.level >= Level::Warning);
         if !args.quiet {
             for d in &outcome.diagnostics {
                 if d.level == Level::Info && !args.verbose {
                     continue;
                 }
-                let d = d.clone().locate(file, &index);
-                any_warning |= d.level >= Level::Warning;
-                report(&d, args.format)?;
+                report(&d.clone().locate(file, &index), args.format)?;
             }
         }
         any_changed |= outcome.changed;
@@ -292,7 +293,10 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
             }
         } else if args.write {
             if outcome.changed {
-                let path = input.path.as_ref().expect("--write needs files");
+                let path = input
+                    .path
+                    .as_ref()
+                    .expect("clap requires files with --write");
                 write_atomically(path, &outcome.output)?;
             }
         } else if args.diff {
@@ -332,20 +336,25 @@ fn write_diff(out: &mut impl Write, label: &str, old: &str, new: &str) -> Result
     Ok(())
 }
 
+/// Replace the file's contents: write a sibling temp file, copy the
+/// permissions, rename over the target. A symlink is followed, so the real
+/// file changes and the link stays a link.
 fn write_atomically(path: &Path, content: &str) -> Result<()> {
-    let dir = path
+    let target =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    let dir = target
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let name = path
+    let name = target
         .file_name()
-        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
+        .ok_or_else(|| anyhow!("{} has no file name", target.display()))?;
     let tmp = dir.join(format!(".{}.mathfmt~", name.to_string_lossy()));
     std::fs::write(&tmp, content).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::metadata(&target) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
     Ok(())
 }
 
@@ -364,37 +373,40 @@ fn atom_json(engine: &Engine, atom: &Atom) -> serde_json::Value {
     serde_json::json!({ "atom": atom.key(), "unicode": unicode, "name": name })
 }
 
-fn emit(kind: Emit, engine: &Engine, profile: &Profile, input: &Input) -> Result<()> {
-    let mut out = io::stdout().lock();
+/// One input's `--emit` output, as JSON lines.
+fn emit(kind: Emit, engine: &Engine, profile: &Profile, input: &Input) -> Result<String> {
+    let mut out = String::new();
     let label = input.label();
     let index = LineIndex::new(&input.text);
     let src = input.text.as_str();
+    let mut line = |v: serde_json::Value| {
+        out.push_str(&v.to_string());
+        out.push('\n');
+    };
     match kind {
         Emit::Symbols => {
             for s in engine.inventory(src, profile) {
-                let v = serde_json::json!({
+                line(serde_json::json!({
                     "file": label,
                     "atom": s.atom.key(),
                     "unicode": s.unicode.map(|c| c.to_string()),
                     "name": s.name,
                     "count": s.count,
                     "spellings": s.spellings,
-                });
-                writeln!(out, "{v}")?;
+                }));
             }
         }
         Emit::Atoms => {
             let outcome = engine.convert(src, profile, &RenameMap::new());
             for o in &outcome.occurrences {
-                let v = serde_json::json!({
+                line(serde_json::json!({
                     "file": label,
                     "start": position(&index, o.span.start),
                     "end": position(&index, o.span.end),
                     "source": o.span.text(src),
                     "kind": format!("{:?}", o.kind).to_lowercase(),
                     "atoms": o.atoms.iter().map(|a| atom_json(engine, a)).collect::<Vec<_>>(),
-                });
-                writeln!(out, "{v}")?;
+                }));
             }
         }
         Emit::Regions | Emit::Tokens => {
@@ -402,7 +414,7 @@ fn emit(kind: Emit, engine: &Engine, profile: &Profile, input: &Input) -> Result
                 src,
                 &engine.signatures,
                 &engine.scan_options,
-                engine.macros.clone(),
+                &engine.macros,
             );
             for r in &doc.regions {
                 let region_kind = match &r.kind {
@@ -413,37 +425,35 @@ fn emit(kind: Emit, engine: &Engine, profile: &Profile, input: &Input) -> Result
                 };
                 let body = r.body();
                 if kind == Emit::Regions {
-                    let v = serde_json::json!({
+                    line(serde_json::json!({
                         "file": label,
                         "kind": region_kind,
                         "start": position(&index, body.start),
                         "end": position(&index, body.end),
                         "text": body.text(src),
-                    });
-                    writeln!(out, "{v}")?;
+                    }));
                 } else {
                     for t in lex_all(body.text(src)) {
                         let start = body.start + t.span.start;
                         let end = body.start + t.span.end;
-                        let v = serde_json::json!({
+                        line(serde_json::json!({
                             "file": label,
                             "region": region_kind,
                             "kind": t.kind,
                             "text": &src[start..end],
                             "start": position(&index, start),
-                        });
-                        writeln!(out, "{v}")?;
+                        }));
                     }
                 }
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn table(profile: Option<String>, config: Option<PathBuf>) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("current directory")?;
-    let config = load_config(config.as_deref(), &cwd)?;
+    let (_, config) = locate_config(config.as_deref(), &cwd)?;
     let engine = Engine::new(config)?;
     let profile = engine.profile(profile.as_deref())?;
     let mut out = io::stdout().lock();
@@ -463,13 +473,14 @@ fn table(profile: Option<String>, config: Option<PathBuf>) -> Result<ExitCode> {
             engine.table.latex_of(&atom).unwrap_or(""),
             mathfmt_core::print::spelling(&atom, &profile, &engine.table).unwrap_or_default(),
             info.and_then(|i| i.name.as_deref()).unwrap_or(""),
-            info.map(|i| i
-                .aliases
-                .iter()
-                .map(|a| format!("\\{a}"))
-                .collect::<Vec<_>>()
-                .join(","))
-                .unwrap_or_default(),
+            info.map(|i| {
+                i.aliases
+                    .iter()
+                    .map(|a| format!("\\{a}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default(),
         )?;
     }
     Ok(ExitCode::SUCCESS)

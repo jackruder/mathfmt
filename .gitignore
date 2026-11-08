@@ -6,3 +6,4 @@
 *.log
 /tests/fixtures/**/actual.tex
 .direnv/
+/.cargo-home

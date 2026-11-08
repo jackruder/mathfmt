@@ -178,3 +178,96 @@ fn macros_flag_takes_one_file_and_leaves_the_positionals() {
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "$x ∈ ℝ$\n");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn strict_counts_warnings_even_under_quiet() {
+    let (code, out, err) = run_stdin(&["--profile", "ascii", "--strict", "-q"], "$∆$\n");
+    assert_eq!(code, 1);
+    assert_eq!(out, "$∆$\n");
+    assert!(err.is_empty(), "{err}");
+}
+
+#[test]
+fn write_needs_files_and_excludes_diff() {
+    let (code, _, err) = run_stdin(&["--write"], "$\\alpha$\n");
+    assert_eq!(code, 2, "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    let dir = temp_dir("write-diff");
+    let f = dir.join("f.tex");
+    fs::write(&f, "$\\alpha$\n").unwrap();
+    let out = mathfmt()
+        .arg("--write")
+        .arg("--diff")
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        fs::read_to_string(&f).unwrap(),
+        "$\\alpha$\n",
+        "nothing written"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_follows_symlinks() {
+    let dir = temp_dir("symlink");
+    let real = dir.join("real.tex");
+    let link = dir.join("link.tex");
+    fs::write(&real, "$\\alpha$\n").unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let out = mathfmt().arg("--write").arg(&link).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "$α$\n",
+        "the target changed"
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is still a link"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn emit_keeps_argument_order_across_configs() {
+    let dir = temp_dir("emit-order");
+    let a = dir.join("a");
+    let b = dir.join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(b.join("mathfmt.toml"), "profile = \"ascii\"\n").unwrap();
+    fs::write(b.join("2.tex"), "$α$\n").unwrap();
+    fs::write(a.join("1.tex"), "$β$\n").unwrap();
+    fs::write(a.join("3.tex"), "$γ$\n").unwrap();
+    let out = mathfmt()
+        .arg("--emit")
+        .arg("symbols")
+        .arg(b.join("2.tex"))
+        .arg(a.join("1.tex"))
+        .arg(a.join("3.tex"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let files: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["file"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        files[0].ends_with("2.tex") && files[1].ends_with("1.tex") && files[2].ends_with("3.tex"),
+        "{files:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

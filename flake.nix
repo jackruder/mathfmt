@@ -17,14 +17,16 @@
 
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-      # What a build sees: the manifests, the lockfile, the crates (the data
-      # tables are embedded from crates/mathfmt-core/data) and tests/ (the
-      # golden fixtures). Not target/, docs/ or the rig.
+      # What a build sees: the manifests, the lockfile, the CLI (src/), the
+      # library crate (its data tables are embedded from crates/mathfmt-core/data)
+      # and tests/ (the integration tests and golden fixtures). Not target/,
+      # docs/ or the rig.
       src = lib.fileset.toSource {
         root = ./.;
         fileset = lib.fileset.unions [
           ./Cargo.toml
           ./Cargo.lock
+          ./src
           ./crates
           ./tests
         ];
@@ -59,8 +61,8 @@
         pkgs:
         let
           # Every crate Cargo.lock names, unpacked with its checksum file, as
-          # cargo's vendored-source layout. tests/dev.sh points cargo at it, so
-          # a phalanix seat (whose proxy allows no crates.io) and a laptop with
+          # cargo's vendored-source layout. The shell points cargo at it, so a
+          # phalanix seat (whose proxy allows no crates.io) and a laptop with
           # no network both build; the nix daemon fetches the crates instead.
           vendor = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
         in
@@ -76,6 +78,25 @@
             ];
             CARGO_VENDOR_DIR = "${vendor}";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            # The source replacement lives in $CARGO_HOME/config.toml rather
+            # than in --config flags: cargo does not pass those to external
+            # subcommands, so `cargo clippy` (and rust-analyzer) would still
+            # look for crates.io. A per-checkout CARGO_HOME, git-ignored, makes
+            # every cargo entry point offline and vendored.
+            shellHook = ''
+              export CARGO_HOME="$PWD/.cargo-home"
+              mkdir -p "$CARGO_HOME"
+              cat > "$CARGO_HOME/config.toml" <<EOF
+              [source.crates-io]
+              replace-with = "vendored"
+
+              [source.vendored]
+              directory = "$CARGO_VENDOR_DIR"
+
+              [net]
+              offline = true
+              EOF
+            '';
           };
         }
       );

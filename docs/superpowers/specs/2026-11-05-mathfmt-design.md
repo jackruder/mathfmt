@@ -398,7 +398,7 @@ exactly what the tool believes.
 - `tests/fixtures/<case>/`: `input.tex`, `mathfmt.toml` (optional; the default
   config otherwise), `expected.tex`, and optionally `expected.stderr` and
   `args` (one CLI argument per line). The harness in
-  `crates/mathfmt/tests/golden.rs` runs each case through the library,
+  `tests/golden.rs` runs each case through the library,
   compares bytes, then asserts idempotence (the expected output through the
   same profile is unchanged).
 - Round trip: fixtures tagged `roundtrip` are run `unicode → ascii → unicode`
@@ -414,8 +414,10 @@ exactly what the tool believes.
 ```
 mathfmt/
   Cargo.toml                 workspace
+  src/main.rs                the CLI; the root is the CLI package so pre-commit's
+                             `cargo install --path .` works
   crates/mathfmt-core/       the library: scan, lex, parse, macros, resolve, profile, print, config, diag
-  crates/mathfmt/            the CLI
+  tests/golden.rs, cli.rs    the integration tests
   crates/mathfmt-core/data/  the tables (§12)
   tools/gen-table.py         the generator (§12)
   tests/fixtures/            golden cases (§14)
@@ -508,3 +510,39 @@ mathfmt/
   paper (eight files, 715 occurrences, 66 distinct atoms) converts in about
   25 ms with no warnings, and the unicode → ascii → unicode round trip returns
   every file byte for byte.
+
+### 2026-11-07, from the first adversarial review
+
+Fifteen findings; all accepted.
+
+- **§15, layout.** The root manifest is the CLI package and the library is a
+  workspace member. pre-commit's `language: rust` runs
+  `cargo install --path .` at the hook repository's root, which a virtual
+  workspace refuses.
+- **§16, dev shell.** The vendored-source replacement is written to a
+  per-checkout `.cargo-home/config.toml` by the shell hook, not passed as
+  `--config` flags: cargo does not forward those to external subcommands, so
+  `cargo clippy` in a seat looked for crates.io. Every cargo entry point,
+  rust-analyzer included, now sees the same offline configuration.
+- **§11, flags.** `--strict` counts warnings whether or not `--quiet` hides
+  them. `--write` requires at least one FILE (a usage error, exit 2, instead
+  of a panic on stdin) and conflicts with `--diff`. `--write` follows a
+  symlink and replaces its target, so the link stays a link. `--emit` prints
+  in argument order when inputs span several config files.
+- **§7, `\ensuremath`.** Signatures gain a `transparent` flag; `\ensuremath`
+  carries it, so a body of `\ensuremath{\mathbb{R}}` inlines as the spec
+  always said.
+- **§5, verbatim arguments.** The first argument of `\url`, `\href`, `\path`,
+  `\nolinkurl` and `\lstinline` is read with braces counted and `%` and `\`
+  literal (a percent-encoded URL used to comment out the rest of the line),
+  and a delimiter form (`\lstinline|…|`, `\url|…|`) is skipped like `\verb`,
+  with any `[options]` before it.
+- **§4, the macro table.** The parser borrows the definitions in force and
+  collects a file's own in a small local table merged on return, so an
+  expansion no longer copies the whole table.
+- **§14, the harness.** `args` files support `--profile`, `--macros` and
+  `rename --from --to`, as CLAUDE.md now says; a flag with no value panics
+  with its name; the round trip's starting profile falls back to the case's
+  config.
+- The README's staged-files example read stdin when nothing was staged; the
+  example names files and the stdin fallback is stated next to the exit codes.

@@ -20,7 +20,7 @@ both directions; parameterized notations are designed and not yet built. See
 ## Install
 
 ```sh
-cargo install --path crates/mathfmt        # any platform with a Rust toolchain
+cargo install --path .                      # any platform with a Rust toolchain
 nix build                                   # Linux and macOS; ./result/bin/mathfmt
 nix profile install .                       # or add the flake's package to your configuration
 ```
@@ -50,13 +50,15 @@ mathfmt table [--profile NAME]
 ```sh
 mathfmt < draft.tex > out.tex
 mathfmt --profile unicode --write sections/*.tex
-mathfmt --check --diff $(git diff --name-only --cached -- '*.tex')
+mathfmt --check --diff main.tex sections/*.tex
 mathfmt --emit symbols main.tex | jq -r .atom | sort | uniq -c
 mathfmt rename --from 𝔉 --to ℱ --write sections/*.tex
 ```
 
 Exit status: 0 clean; 1 `--check` found changes or `--strict` found warnings;
-2 usage, config or I/O error. Silent on success.
+2 usage, config or I/O error. Silent on success. With no FILE it reads stdin,
+so guard a shell expansion that may come back empty; a pre-commit hook passes
+the files itself.
 
 A project's `mathfmt.toml` names the definition files whose macros the tool
 reads and the profiles it may emit; two profiles, `unicode` and `ascii`, exist

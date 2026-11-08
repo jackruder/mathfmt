@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use mathfmt_core::{Config, Diagnostic, Engine, Level, LineIndex, RenameMap};
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 struct Case {
@@ -26,6 +26,14 @@ struct Case {
     rename: Option<(String, String)>,
     expected_stderr: Option<String>,
     roundtrip: bool,
+}
+
+/// The value after a flag in an `args` file, or a clear panic.
+fn value<'a>(words: &[&'a str], i: usize, dir: &Path) -> &'a str {
+    words
+        .get(i + 1)
+        .copied()
+        .unwrap_or_else(|| panic!("{}: args: `{}` needs a value", dir.display(), words[i]))
 }
 
 fn load_case(dir: &Path) -> Case {
@@ -45,20 +53,20 @@ fn load_case(dir: &Path) -> Case {
         while i < words.len() {
             match words[i] {
                 "--profile" | "-p" => {
-                    profile = Some(words[i + 1].to_string());
+                    profile = Some(value(&words, i, dir).to_string());
                     i += 2;
                 }
                 "--macros" => {
-                    macros.push(dir.join(words[i + 1]));
+                    macros.push(dir.join(value(&words, i, dir)));
                     i += 2;
                 }
                 "rename" => i += 1,
                 "--from" => {
-                    from = Some(words[i + 1].to_string());
+                    from = Some(value(&words, i, dir).to_string());
                     i += 2;
                 }
                 "--to" => {
-                    to = Some(words[i + 1].to_string());
+                    to = Some(value(&words, i, dir).to_string());
                     i += 2;
                 }
                 other => panic!("{}: args: unknown `{other}`", dir.display()),
@@ -177,7 +185,10 @@ fn golden_fixtures() {
             ));
         }
         if case.roundtrip {
-            let here = case.profile.as_deref().unwrap_or("unicode");
+            let here = case
+                .profile
+                .as_deref()
+                .unwrap_or(engine.config.default_profile_name());
             let other = if here == "ascii" { "unicode" } else { "ascii" };
             let (there, _) = convert(&engine, &case, &case.expected, Some(other));
             let (back, _) = convert(&engine, &case, &there, Some(here));

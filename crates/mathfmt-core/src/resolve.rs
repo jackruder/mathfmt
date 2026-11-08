@@ -146,7 +146,8 @@ impl<'a> Resolver<'a> {
                 return self.styled_group(c, style, out);
             }
             // \mathnormal and ordinary commands: look inside the arguments.
-            let mut complete = sig.plain;
+            let transparent = sig.plain || sig.transparent;
+            let mut complete = transparent;
             for arg in &c.args {
                 match arg {
                     Arg::Math(n) | Arg::Delim(n) => {
@@ -161,7 +162,7 @@ impl<'a> Resolver<'a> {
                     Arg::Optional(_) => complete = false,
                 }
             }
-            return complete && sig.plain;
+            return complete && transparent;
         }
         if c.args.is_empty() {
             if let Some(atom) = self.table.atom_of_name(name) {
@@ -354,7 +355,7 @@ mod tests {
     fn run(src: &str) -> (Vec<Occurrence>, Vec<Diagnostic>, String) {
         let table = Table::builtin();
         let sigs = Signatures::builtin();
-        let doc = scan(src, &sigs, &ScanOptions::default(), MacroTable::new());
+        let doc = scan(src, &sigs, &ScanOptions::default(), &MacroTable::new());
         let profile = Config::default().profile("unicode").unwrap();
         let (occ, diags) = resolve(&doc, src, &table, &sigs, &profile);
         (occ, diags, src.to_string())
@@ -445,6 +446,15 @@ mod tests {
         assert_eq!(
             show(&occ, &src),
             vec![(r"\in".into(), "∈".into()), ("∈".into(), "∈".into())]
+        );
+    }
+
+    #[test]
+    fn ensuremath_bodies_inline() {
+        let (occ, _, src) = run("\\newcommand{\\R}{\\ensuremath{\\mathbb{R}}} $x \\in \\R$");
+        assert_eq!(
+            show(&occ, &src),
+            vec![(r"\in".into(), "∈".into()), (r"\R".into(), "bb:R".into())]
         );
     }
 

@@ -14,14 +14,16 @@ work in the repository. It is loaded by every seat of the mathfmt rig
   event, a paragraph per task copied from its report). `docs/REVIEW-*.md`: a
   wave's adversarial review.
 - `crates/mathfmt-core/`: the library, one module per pipeline stage (scan,
-  lex, parse, macros, resolve, profile, print, config, diag). `crates/mathfmt/`:
-  the CLI, thin.
+  lex, parse, macros, resolve, profile, print, config, diag). `src/main.rs`:
+  the CLI, thin; it is the root package so that pre-commit's
+  `cargo install --path .` works.
 - `crates/mathfmt-core/data/`: the tables. `unicode-math.tsv` and
   `alphabets.tsv` are generated; `latex.tsv` and `signatures.tsv` are written
   by hand and are where a symbol, an alias or a command signature is added.
 - `tools/gen-table.py`: regenerates the two generated tables from
   `kpsewhich unicode-math-table.tex`.
-- `tests/fixtures/<case>/`: the golden cases. `tests/dev.sh`: the dev shell
+- `tests/fixtures/<case>/`: the golden cases, run by `tests/golden.rs`;
+  `tests/cli.rs`: the binary's interface. `tests/dev.sh`: the dev shell
   wrapper. `flake.nix`: dev shell, package and checks.
 - `.phalanix/`: the rig (lead, and task/review/question templates) and its
   roles, for waves run on phalanix.
@@ -46,6 +48,9 @@ as the seat), puts `nix` on PATH (a seat's PATH has none) and runs from the
 root. If a seat's PATH has no bash for the shebang, run
 `/run/current-system/sw/bin/bash repo/tests/dev.sh <command>` and report it.
 
+- The dev shell writes `.cargo-home/config.toml` (git-ignored), pointing
+  cargo at the vendored crates and setting it offline, so `cargo`,
+  `cargo clippy` and rust-analyzer all build without network.
 - Nix sees only what git tracks. Commit, or at least `git add`, before any
   `nix build`, `nix flake check` or a wrapper run that needs a new file; a new
   dependency reaches the shell once the updated `Cargo.lock` is added.
@@ -63,8 +68,10 @@ last commit, and the ledger records the counts.
 A golden case is a directory `tests/fixtures/<case>/` holding `input.tex`,
 `expected.tex`, and optionally `mathfmt.toml` (the config; the defaults
 otherwise), `expected.stderr` (the diagnostics) and `args` (one CLI argument
-per line). The harness runs every case, compares bytes, then asserts idempotence:
-`expected.tex` through the same profile is unchanged. Cases tagged for round
+per line, from the subset the harness understands: `--profile NAME`,
+`--macros FILE`, `rename --from X --to Y`). The harness runs every case,
+compares bytes, then asserts idempotence: `expected.tex` through the same
+profile is unchanged. Cases tagged for round
 trips are run unicode to ascii to unicode and must return to the start.
 
 - Test first: the fixture or unit test that pins the behaviour, watched to fail,

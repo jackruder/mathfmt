@@ -28,6 +28,9 @@ pub struct Signature {
     pub plain: bool,
     /// A `*` right after the name belongs to it.
     pub star: bool,
+    /// Its argument counts as the caller's surroundings (`\ensuremath`):
+    /// atoms inside it are the caller's atoms.
+    pub transparent: bool,
 }
 
 impl Signature {
@@ -37,6 +40,7 @@ impl Signature {
             style: None,
             plain: false,
             star: false,
+            transparent: false,
         }
     }
 
@@ -81,6 +85,8 @@ impl Signatures {
                     sig.plain = true;
                 } else if flag == "star" {
                     sig.star = true;
+                } else if flag == "transparent" {
+                    sig.transparent = true;
                 } else {
                     panic!("signatures.tsv: unknown flag `{flag}` for \\{name}");
                 }
@@ -131,6 +137,7 @@ mod tests {
         assert_eq!(s.get("boldsymbol").unwrap().style, Some(Style::BfIt));
         assert!(s.get("mathnormal").unwrap().plain);
         assert!(s.get("operatorname").unwrap().star);
+        assert!(s.get("ensuremath").unwrap().transparent);
         assert_eq!(s.get("text").unwrap().args, vec![ArgKind::Text]);
         assert_eq!(s.get("left").unwrap().args, vec![ArgKind::Delim]);
         assert_eq!(

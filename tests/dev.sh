@@ -4,7 +4,7 @@
 #
 #   tests/dev.sh cargo test --workspace
 #   tests/dev.sh cargo clippy --workspace --all-targets -- -D warnings
-#   tests/dev.sh cargo fmt --check
+#   tests/dev.sh cargo fmt --all -- --check
 #   repo/tests/dev.sh cargo test --workspace     # from a seat's state directory
 #
 # A seat's unit exports its identity (PHALANIX_SEAT_ID, PHALANIX_RIG, the live
@@ -13,11 +13,11 @@
 # PHALANIX_* and PG* variable before entering the shell. It also puts nix on
 # PATH (a seat's PATH has none) and runs the command from the repository root.
 #
-# A cargo command runs against the crates the dev shell vendored from
-# Cargo.lock (CARGO_VENDOR_DIR, see flake.nix), offline: a seat's proxy does
-# not allow crates.io, and the nix daemon has already fetched every crate.
-# Any other command runs as given. Nix sees only what git tracks, so a new
-# dependency reaches the shell once Cargo.lock is added.
+# The dev shell itself (flake.nix) points cargo at the crates nix vendored
+# from Cargo.lock and sets it offline, through a per-checkout CARGO_HOME
+# (.cargo-home/, git-ignored), so cargo, cargo clippy and rust-analyzer all
+# build with no network. Nix sees only what git tracks, so a new dependency
+# reaches the shell once Cargo.lock is added.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,14 +37,4 @@ done
 
 cd "$ROOT"
 exec env "${drop[@]}" PATH="$PATH:$(dirname "$NIX")" \
-	"$NIX" develop "$ROOT" --command bash -c '
-		if [ "$1" = cargo ]; then
-			shift
-			set -- cargo \
-				--config "source.crates-io.replace-with=\"vendored\"" \
-				--config "source.vendored.directory=\"$CARGO_VENDOR_DIR\"" \
-				"$@"
-			export CARGO_NET_OFFLINE=true
-		fi
-		exec "$@"
-	' dev.sh "$@"
+	"$NIX" develop "$ROOT" --command "$@"

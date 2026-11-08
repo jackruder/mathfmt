@@ -136,12 +136,7 @@ impl Engine {
     }
 
     pub fn add_macro_source(&mut self, text: &str) {
-        let doc = scan(
-            text,
-            &self.signatures,
-            &self.scan_options,
-            self.macros.clone(),
-        );
+        let doc = scan(text, &self.signatures, &self.scan_options, &self.macros);
         self.macros = doc.macros;
     }
 
@@ -154,12 +149,7 @@ impl Engine {
 
     /// Convert one file's text.
     pub fn convert(&self, src: &str, profile: &Profile, rename: &RenameMap) -> Outcome {
-        let document = scan(
-            src,
-            &self.signatures,
-            &self.scan_options,
-            self.macros.clone(),
-        );
+        let document = scan(src, &self.signatures, &self.scan_options, &self.macros);
         let mut diagnostics = document.diagnostics.clone();
         let (occurrences, more) =
             resolve::resolve(&document, src, &self.table, &self.signatures, profile);
@@ -180,12 +170,7 @@ impl Engine {
 
     /// The notation inventory of one file: each atom, how often, spelled how.
     pub fn inventory(&self, src: &str, profile: &Profile) -> Vec<SymbolCount> {
-        let document = scan(
-            src,
-            &self.signatures,
-            &self.scan_options,
-            self.macros.clone(),
-        );
+        let document = scan(src, &self.signatures, &self.scan_options, &self.macros);
         let (occurrences, _) =
             resolve::resolve(&document, src, &self.table, &self.signatures, profile);
         let mut map: BTreeMap<Atom, SymbolCount> = BTreeMap::new();
@@ -214,12 +199,7 @@ impl Engine {
     /// to exactly one atom.
     pub fn parse_atom(&self, spelling: &str, profile: &Profile) -> Result<Atom, Error> {
         let src = format!("${spelling}$");
-        let document = scan(
-            &src,
-            &self.signatures,
-            &self.scan_options,
-            self.macros.clone(),
-        );
+        let document = scan(&src, &self.signatures, &self.scan_options, &self.macros);
         let (occurrences, _) =
             resolve::resolve(&document, &src, &self.table, &self.signatures, profile);
         let atoms: Vec<Atom> = occurrences.into_iter().flat_map(|o| o.atoms).collect();

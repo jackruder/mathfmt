@@ -325,7 +325,7 @@ mod tests {
     fn convert(src: &str, profile: &str) -> (String, Vec<Diagnostic>) {
         let table = Table::builtin();
         let sigs = Signatures::builtin();
-        let doc = scan(src, &sigs, &ScanOptions::default(), MacroTable::new());
+        let doc = scan(src, &sigs, &ScanOptions::default(), &MacroTable::new());
         let profile = Config::default().profile(profile).unwrap();
         let (occ, mut diags) = resolve(&doc, src, &table, &sigs, &profile);
         let (edits, more) = plan(src, &occ, &profile, &table, &RenameMap::new());

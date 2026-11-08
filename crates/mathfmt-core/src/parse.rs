@@ -179,19 +179,20 @@ pub struct Document {
 
 /// Scan a whole file. `macros` are the definitions already in force (from the
 /// config's definition files); the file's own definitions are added.
-pub fn scan(src: &str, sigs: &Signatures, opts: &ScanOptions, macros: MacroTable) -> Document {
+pub fn scan(src: &str, sigs: &Signatures, opts: &ScanOptions, macros: &MacroTable) -> Document {
     let mut p = Parser {
         src,
         pos: 0,
         sigs,
         opts,
-        macros,
+        base: macros,
+        local: MacroTable::new(),
         diags: Vec::new(),
     };
     let regions = p.parse_text(TextEnd::Eof);
     Document {
         regions,
-        macros: p.macros,
+        macros: p.merged_macros(),
         diagnostics: p.diags,
     }
 }
@@ -208,7 +209,8 @@ pub fn parse_math_str(
         pos: 0,
         sigs,
         opts: &opts,
-        macros: macros.clone(),
+        base: macros,
+        local: MacroTable::new(),
         diags: Vec::new(),
     };
     let (nodes, _) = p.parse_math(&MathEnd::Eof);
@@ -253,7 +255,11 @@ struct Parser<'a> {
     pos: usize,
     sigs: &'a Signatures,
     opts: &'a ScanOptions,
-    macros: MacroTable,
+    /// Definitions in force before this scan (borrowed, never copied per
+    /// expansion).
+    base: &'a MacroTable,
+    /// Definitions this scan found.
+    local: MacroTable,
     diags: Vec<Diagnostic>,
 }
 
@@ -273,6 +279,70 @@ fn has_blank_line(s: &str) -> bool {
 }
 
 impl<'a> Parser<'a> {
+    /// The table after this scan: what was in force plus what it defined.
+    fn merged_macros(&self) -> MacroTable {
+        let mut t = self.base.clone();
+        t.extend(self.local.clone());
+        t
+    }
+
+    /// At `{`: the span of the contents up to the matching `}`, counting
+    /// braces only (`%` and `\` are literal), with `pos` left after it.
+    fn read_raw_group(&mut self) -> Option<Span> {
+        if self.peek() != Some('{') {
+            return None;
+        }
+        let start = self.pos + 1;
+        let mut depth = 0usize;
+        for (i, b) in self.src.as_bytes()[self.pos..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.pos += i + 1;
+                        return Some(Span::new(start, start + i - 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The argument of `\url`, `\href`, `\lstinline` and friends is verbatim:
+    /// `%` and `\` mean nothing in it, and it may be delimited by a repeated
+    /// character instead of braces. Skip it, and any `[options]` before it.
+    fn skip_verbatim_argument(&mut self) {
+        let save = self.pos;
+        self.skip_trivia();
+        if self.peek() == Some('[') {
+            if self.read_bracket().is_none() {
+                self.pos = save;
+                return;
+            }
+            self.skip_trivia();
+        }
+        match self.peek() {
+            Some('{') => {
+                if self.read_raw_group().is_none() {
+                    self.pos = save;
+                }
+            }
+            Some(d)
+                if d.is_ascii_punctuation()
+                    && !matches!(d, '{' | '}' | '[' | ']' | '*' | '\\' | '%' | '$') =>
+            {
+                self.advance(d);
+                match self.src[self.pos..].find(d) {
+                    Some(i) => self.pos += i + d.len_utf8(),
+                    None => self.pos = save,
+                }
+            }
+            _ => self.pos = save,
+        }
+    }
+
     fn peek(&self) -> Option<char> {
         self.src[self.pos..].chars().next()
     }
@@ -513,13 +583,7 @@ impl<'a> Parser<'a> {
                     self.pos = save;
                 }
             }
-            n if self.opts.url_commands.contains(n) => {
-                let save = self.pos;
-                self.skip_trivia();
-                if self.read_balanced_group().is_none() {
-                    self.pos = save;
-                }
-            }
+            n if self.opts.url_commands.contains(n) => self.skip_verbatim_argument(),
             n if DEFINITION_COMMANDS.contains(&n) => self.parse_definition(n, tok),
             _ => {}
         }
@@ -624,7 +688,7 @@ impl<'a> Parser<'a> {
         } else {
             return false;
         };
-        self.macros.insert(Macro {
+        self.local.insert(Macro {
             name,
             params,
             optional_default: default,
@@ -646,7 +710,7 @@ impl<'a> Parser<'a> {
         let Some(b) = self.read_balanced_group() else {
             return false;
         };
-        self.macros.insert(Macro {
+        self.local.insert(Macro {
             name,
             params: 0,
             optional_default: None,
@@ -694,7 +758,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.macros.insert(Macro {
+        self.local.insert(Macro {
             name,
             params,
             optional_default: None,
@@ -755,7 +819,7 @@ impl<'a> Parser<'a> {
             }
             first = false;
         }
-        self.macros.insert(Macro {
+        self.local.insert(Macro {
             name,
             params,
             optional_default: default,
@@ -899,7 +963,7 @@ impl<'a> Parser<'a> {
     }
 
     fn signature_for(&self, name: &str) -> Signature {
-        if let Some(m) = self.macros.get(name) {
+        if let Some(m) = self.local.get(name).or_else(|| self.base.get(name)) {
             return match m.kind {
                 MacroKind::Operator => Signature::none(),
                 MacroKind::Command => {
@@ -1014,7 +1078,7 @@ mod tests {
 
     fn scan_default(src: &str) -> Document {
         let sigs = Signatures::builtin();
-        scan(src, &sigs, &ScanOptions::default(), MacroTable::new())
+        scan(src, &sigs, &ScanOptions::default(), &MacroTable::new())
     }
 
     fn bodies(src: &str) -> Vec<String> {
@@ -1039,6 +1103,15 @@ mod tests {
     fn escapes_comments_and_verbatim_are_not_math() {
         let src = "cost \\$5 % not $math$\n\\verb|$x$| \\begin{verbatim}\n$y$\n\\end{verbatim} \\url{http://a.b/$c} $z$ \\\\(not) $w$";
         assert_eq!(bodies(src), vec!["z", "w"]);
+    }
+
+    #[test]
+    fn url_arguments_are_verbatim() {
+        let src = "See \\url{http://x.y/%7Euser} and $\\alpha$. \\lstinline|$\\beta$| then $\\gamma$, \\lstinline[language=C]!$x$! and $\\delta$. \\href{http://a/%20b}{see $\\epsilon$}";
+        assert_eq!(
+            bodies(src),
+            vec!["\\alpha", "\\gamma", "\\delta", "\\epsilon"]
+        );
     }
 
     #[test]

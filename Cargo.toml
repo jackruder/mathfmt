@@ -1,6 +1,31 @@
+# The root is the CLI package, so that pre-commit's `cargo install --path .`
+# and `cargo install --path .` by hand both work; the library is a member.
+[package]
+name = "mathfmt"
+description = "A filter that enforces math-notation conventions in LaTeX source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mathfmt"
+path = "src/main.rs"
+
+[dependencies]
+mathfmt-core = { path = "crates/mathfmt-core" }
+clap = { version = "4", features = ["derive", "wrap_help"] }
+rayon = "1"
+similar = "2"
+anyhow = "1"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [workspace]
 resolver = "2"
-members = ["crates/mathfmt-core", "crates/mathfmt"]
+members = ["crates/mathfmt-core"]
 
 [workspace.package]
 version = "0.1.0"
