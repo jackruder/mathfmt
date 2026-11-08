@@ -507,7 +507,7 @@ mathfmt/
 - **§6, `cal`/`scr` on read.** The profile key is `script_reads_as`; the
   default `cal`.
 - **§14, fixtures.** Thirteen cases shipped; the smoke test over the ICML
-  paper (eight files, 715 occurrences, 66 distinct atoms) converts in about
+  paper (eight files, 677 occurrences, 48 distinct atoms) converts in about
   25 ms with no warnings, and the unicode → ascii → unicode round trip returns
   every file byte for byte.
 

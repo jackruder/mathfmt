@@ -76,8 +76,8 @@ mathfmt --check --diff --macros ddssm.sty main.tex sections/*.tex
 | | |
 |---|---|
 | time for all eight files | about 25 ms |
-| symbol occurrences rewritten | 715 |
-| distinct symbols | 66 |
+| symbol occurrences rewritten | 677 |
+| distinct symbols | 48 |
 | warnings | 0 |
 | style groups left as written (`\mathbf{\sigma_\theta}`) | 2, reported with `-v` |
 
