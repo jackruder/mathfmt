@@ -1,0 +1,1 @@
+differs: pdflatex renders \mathbf{\sigma} plain while mathfmt reads it as bold upright 𝛔, which the ascii profile spells \boldsymbol{\sigma} and pdflatex sets bold (the bf_greek collapse); \mathbf{\Sigma} is bold in pdflatex and survives

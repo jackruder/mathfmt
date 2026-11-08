@@ -22,9 +22,11 @@ work in the repository. It is loaded by every seat of the mathfmt rig
   by hand and are where a symbol, an alias or a command signature is added.
 - `tools/gen-table.py`: regenerates the two generated tables from
   `kpsewhich unicode-math-table.tex`.
-- `tests/fixtures/<case>/`: the golden cases, run by `tests/golden.rs`;
-  `tests/cli.rs`: the binary's interface. `tests/dev.sh`: the dev shell
-  wrapper. `flake.nix`: dev shell, package and checks.
+- `tests/fixtures/<case>/`: the golden cases, run by `tests/golden.rs` and
+  compiled and compared by `tests/verify.rs`; `tests/cli.rs`: the binary's
+  interface. `tests/dev.sh`: the dev shell wrapper. `flake.nix`: dev shell,
+  package and checks. `src/verify.rs`: the `--verify` mode (compile both
+  sides, rasterize, compare).
 - `.phalanix/`: the rig (lead, and task/review/question templates) and its
   roles, for waves run on phalanix.
 
@@ -55,8 +57,12 @@ root. If a seat's PATH has no bash for the shebang, run
   `nix build`, `nix flake check` or a wrapper run that needs a new file; a new
   dependency reaches the shell once the updated `Cargo.lock` is added.
 - `nix build` builds the binary and runs the tests. The flake checks are
-  `build`, `clippy` and `fmt`: `nix build .#checks.x86_64-linux.<name>`, or in
-  a seat `/run/current-system/sw/bin/nix build ./repo#checks.x86_64-linux.<name>`.
+  `build`, `clippy`, `fmt` and `verify`: `nix build .#checks.x86_64-linux.<name>`,
+  or in a seat `/run/current-system/sw/bin/nix build ./repo#checks.x86_64-linux.<name>`.
+  `verify` brings a TeX Live and runs `tests/verify.rs` with
+  `MATHFMT_VERIFY_REQUIRED` set; elsewhere that test skips itself when
+  `pdflatex` or `pdftoppm` is missing (the dev shell on a machine with TeX
+  Live has them on PATH, so `cargo test` runs it).
 - Dependencies are what `Cargo.toml` lists; a new one is a decision for the
   plan, not a convenience.
 
@@ -73,6 +79,15 @@ per line, from the subset the harness understands: `--profile NAME`,
 compares bytes, then asserts idempotence: `expected.tex` through the same
 profile is unchanged. Cases tagged for round
 trips are run unicode to ascii to unicode and must return to the start.
+
+Every case is also compiled before and after (`tests/verify.rs` runs
+`mathfmt --verify` on `input.tex` with the case's `args`) and must render the
+same pages. A case whose conversion changes the typeset result on purpose (a
+rename; a spelling that repairs pdflatex) says so in `expected.verify`:
+`differs: reason`. One that cannot compile at all says `skip: reason`. A
+snippet must be compilable: define the macros it uses, and keep preamble-only
+commands (`\usepackage`, `\DeclareMathOperator`) on their own lines, which the
+wrapper hoists.
 
 - Test first: the fixture or unit test that pins the behaviour, watched to fail,
   then the code.

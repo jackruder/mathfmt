@@ -1,0 +1,1 @@
+skip: ∆ (U+2206) is what the case is about: nothing in pdflatex or unicode-math-input defines it, so the original does not compile

@@ -123,6 +123,45 @@
             installPhase = "touch $out";
           });
 
+          # The compile-and-compare test (tests/verify.rs) over the fixtures,
+          # with a TeX Live that has what the built-in snippet preamble loads
+          # and poppler for pdftoppm. The ordinary `build` check skips this
+          # test for want of pdflatex; here it is required.
+          verify =
+            let
+              tex = pkgs.texliveSmall.withPackages (
+                ps: with ps; [
+                  unicode-math-input
+                  bbm
+                  bbm-macros
+                  jknapltx
+                  rsfs
+                  mathtools
+                  listings
+                  url
+                  doublestroke
+                ]
+              );
+            in
+            mathfmt.overrideAttrs (old: {
+              pname = "mathfmt-verify";
+              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                tex
+                pkgs.poppler-utils
+              ];
+              MATHFMT_VERIFY_REQUIRED = "1";
+              # bbm's fonts are METAFONT only; mktexpk needs a writable home.
+              preCheck = ''
+                export HOME=$TMPDIR
+              '';
+              checkPhase = ''
+                runHook preCheck
+                cargo test --offline --test verify -- --nocapture
+                runHook postCheck
+              '';
+              installPhase = "touch $out";
+            });
+
           fmt =
             pkgs.runCommand "mathfmt-fmt"
               {

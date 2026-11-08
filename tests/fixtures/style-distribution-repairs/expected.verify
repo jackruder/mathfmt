@@ -1,0 +1,1 @@
+differs: every mixed-wrapper spelling is a pdflatex repair: its \mathbf leaves lowercase Greek plain, its \mathbb{1} is the glyph ⊮, and its \mathfrak{I} is not the \Im it shares a codepoint with

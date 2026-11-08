@@ -17,12 +17,13 @@ fn run_stdin(args: &[&str], input: &str) -> (i32, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mathfmt");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // A usage error exits before stdin is read; the pipe may already be
+    // closed, which is not this test's concern.
+    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing stdin: {e}"),
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),

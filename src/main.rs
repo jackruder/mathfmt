@@ -17,11 +17,14 @@ use mathfmt_core::{
     Atom, Config, Diagnostic, Engine, Level, LineIndex, Outcome, Profile, RegionKind, RenameMap,
 };
 
+mod verify;
+
 #[derive(Parser)]
 #[command(name = "mathfmt", version, about = "Rewrite math notation in LaTeX source to one profile", long_about = None)]
 #[command(
-    after_help = "Exit status: 0 clean; 1 --check found changes or --strict found warnings; 2 usage, config or I/O error.\n\
-With no FILE, reads stdin and writes stdout. With FILEs and none of --write, --check, --diff or --emit, writes each converted file to stdout in turn."
+    after_help = "Exit status: 0 clean; 1 --check found changes, --strict found warnings or --verify found a difference; 2 usage, config or I/O error.\n\
+With no FILE, reads stdin and writes stdout. With FILEs and none of --write, --check, --diff, --emit or --verify, writes each converted file to stdout in turn.\n\
+--verify compiles the original and the converted source with the same engine and compares the rendered pages pixel for pixel. A FILE holding \\documentclass is a document, compiled as it is with the converted copies of the other FILEs in place; without one, each FILE is a snippet wrapped in a preamble. Needs the engine and pdftoppm on PATH."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -77,6 +80,27 @@ struct RunArgs {
     /// Print an intermediate stage as JSON lines instead of converting
     #[arg(long, value_enum, value_name = "KIND")]
     emit: Option<Emit>,
+    /// Compile before and after and compare the rendered pages; print a
+    /// verdict per document or snippet, exit 1 on a difference
+    #[arg(long, conflicts_with_all = ["write", "check", "diff", "emit"])]
+    verify: bool,
+    /// The TeX engine --verify compiles with
+    #[arg(
+        long,
+        value_name = "PROGRAM",
+        default_value = "pdflatex",
+        requires = "verify"
+    )]
+    engine: String,
+    /// Preamble for snippets under --verify (default: built in, per engine)
+    #[arg(long, value_name = "FILE", requires = "verify")]
+    preamble: Option<PathBuf>,
+    /// Resolution of the page comparison under --verify
+    #[arg(long, value_name = "N", default_value_t = 100, requires = "verify")]
+    dpi: u32,
+    /// Keep the --verify build directories here
+    #[arg(long, value_name = "DIR", requires = "verify")]
+    keep: Option<PathBuf>,
     /// Diagnostics format
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
@@ -221,10 +245,17 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
 
     let mut converted: Vec<Option<Converted>> = (0..inputs.len()).map(|_| None).collect();
     let mut emitted: Vec<Option<String>> = (0..inputs.len()).map(|_| None).collect();
+    // The engines and profiles stay alive for --verify, which needs them
+    // to build a snippet's preamble.
+    let mut engines: Vec<(Engine, Profile)> = Vec::new();
+    let mut engine_of: Vec<usize> = vec![0; inputs.len()];
     for (key, indices) in groups {
         let config = configs.remove(&key).expect("a config per group");
         let engine = build_engine(config, &args.macros)?;
         let profile: Profile = engine.profile(args.profile.as_deref())?;
+        for &i in &indices {
+            engine_of[i] = engines.len();
+        }
         let rename_map = match &rename {
             Some((from, to)) => {
                 let mut m = RenameMap::new();
@@ -253,6 +284,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
         for (i, c) in results {
             converted[i] = Some(c);
         }
+        engines.push((engine, profile));
     }
 
     let mut stdout = io::stdout().lock();
@@ -266,7 +298,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
 
     let mut any_changed = false;
     let mut any_warning = false;
-    for c in converted.into_iter().flatten() {
+    for c in converted.iter().flatten() {
         let Converted { input, outcome } = c;
         let index = LineIndex::new(&input.text);
         let label = input.label();
@@ -303,12 +335,46 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
             if outcome.changed {
                 write_diff(&mut stdout, &label, &input.text, &outcome.output)?;
             }
-        } else {
+        } else if !args.verify {
             stdout.write_all(outcome.output.as_bytes())?;
         }
     }
     stdout.flush()?;
-    let failed = (args.check && any_changed) || (args.strict && any_warning);
+    let mut any_difference = false;
+    if args.verify {
+        let sources: Vec<verify::Source<'_>> = converted
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+            .map(|(i, c)| {
+                let (engine, profile) = &engines[engine_of[i]];
+                Ok(verify::Source {
+                    path: c
+                        .input
+                        .path
+                        .clone()
+                        .ok_or_else(|| anyhow!("--verify needs FILEs, not stdin"))?,
+                    original: &c.input.text,
+                    converted: &c.outcome.output,
+                    engine,
+                    profile,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let options = verify::Options {
+            engine: args.engine.clone(),
+            preamble: args.preamble.clone(),
+            dpi: args.dpi,
+            keep: args.keep.clone(),
+            macros: args.macros.clone(),
+        };
+        for report in verify::run(&sources, &options)? {
+            any_difference |= report.verdict.is_failure();
+            writeln!(stdout, "{report}")?;
+        }
+        stdout.flush()?;
+    }
+    let failed = (args.check && any_changed) || (args.strict && any_warning) || any_difference;
     Ok(if failed {
         ExitCode::from(1)
     } else {

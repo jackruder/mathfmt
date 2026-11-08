@@ -582,3 +582,66 @@ Fifteen findings; all accepted.
   files of eight; a paper that wants it closed under pdflatex's reading of
   bold Greek sets `bf_greek = "\\mathbf"` in its profile. The compile-and-
   compare check of §13 is what decides such questions from here on.
+
+### 2026-11-08, the compile-and-compare check
+
+- **§11, `--verify`.** A mode of the conversion, beside `--check` and
+  `--diff`: the original and the converted source are compiled with the same
+  engine (`--engine`, default `pdflatex`), both PDFs are rasterized with
+  `pdftoppm` (`--dpi`, default 100) and compared pixel for pixel; a verdict
+  per document is printed (`verified`, `unchanged`, `differs` with every
+  differing page and its box, `broken` with the log's first error) and a
+  difference makes the exit status 1. `pdftotext` supplies a hint, the first
+  differing line of text, when it is available; it cannot tell a bold letter
+  from a plain one, which is why the verdict rests on pixels. `rename` takes
+  the flag too, so a rename can be shown to change exactly what it should.
+  `--keep DIR` keeps the two build trees. It works for `--verify` to need the
+  engine on PATH; mathfmt itself stays a pure filter.
+- **§11, documents and snippets.** A FILE holding `\documentclass` outside a
+  comment is a document: it is compiled as it is, from a copy of all the FILEs
+  at their relative paths, with the document's own directory on `TEXINPUTS`
+  so unlisted style files, figures and inputs are shared; the original is
+  compiled the same way from its own copy, so both sides see the same files.
+  A FILE without one is a snippet, wrapped in a preamble: `--preamble FILE`,
+  or the built-in one for the engine. Lines of a snippet that hold a
+  preamble-only command (`\usepackage`, `\DeclareMathOperator`, …) move into
+  the preamble on both sides. The definition files the engine was given
+  (`macros` in the config, `--macros`) are loaded by the wrapper.
+- **The built-in pdflatex preamble** loads amsmath, amssymb, bm, bbm,
+  mathrsfs, mathtools, url, listings and unicode-math-input, and declares
+  every styled letter or digit the snippet uses, before or after conversion,
+  to mean what the `ascii` profile spells it as (`\umiDeclareMathChar{𝟙}
+  {\mathbbm{1}}`, `\umiDeclareMathChar{𝛂}{\boldsymbol{\alpha}}`). pdflatex
+  has no bold Greek under `\mathbf` and no blackboard digits under `\mathbb`,
+  and unicode-math-input follows pdflatex there, so without the declarations
+  the Unicode side would render as pdflatex's limitations rather than as the
+  table's meaning. Symbols (`∈`, `≤`, `∑`) are left to unicode-math-input's
+  own table, which is the independent check of `latex.tsv`. A document is
+  never given declarations: it is verified under its author's preamble, and
+  that is the point.
+- **§14, the verify test.** `tests/verify.rs` runs `--verify` over every
+  fixture's `input.tex` with the case's `args`, expecting `verified` or
+  `unchanged` unless `expected.verify` says `differs: reason` (a rename; a
+  spelling that repairs or changes the typeset result on purpose) or
+  `skip: reason`. It is skipped without pdflatex and pdftoppm on PATH, and
+  required under `MATHFMT_VERIFY_REQUIRED`, which the flake's `verify` check
+  sets with a TeX Live that has the preamble's packages.
+- **What the check found on its first run.** Six of the seventeen fixtures.
+  Three were fixture faults (folded macros no document defined; a
+  `\DeclareMathOperator` in the body; `∆`, which nothing in pdflatex
+  defines). Three were real: `\mathbb{1}` is the glyph ⊮ in amsfonts, so the
+  `bb_digit` spelling `\mathbbm{1}` repairs it and changes the page;
+  `\mathfrak{I}` and `\Im` share U+2111 but are different glyphs in pdflatex
+  (eufm against cmsy), a third collapse beside `cal`/`scr` and `bf_greek`;
+  and `\mathbf{\alpha\beta}` is plain under pdflatex and bold after
+  conversion, the `bf_greek` collapse again. Those three live in fixtures
+  marked `differs`, with the reason in the file. On the paper, in document
+  mode with `unicode-math-input` added to its preamble, every page renders
+  the same except the indicator `𝟙`, which unicode-math-input reads as
+  `\mathbb{1}` where the paper wrote `\mathbbm{1}`; the paper's preamble
+  would declare it.
+- **§13, engines.** Under `lualatex` with `unicode-math`, `\mathbf{x}` is the
+  text font's bold and `\boldsymbol{\alpha}` is not bold, so the default
+  `ascii` profile is not faithful there; the `\sym…` commands are. A profile
+  for unicode-math is configuration today (`style_commands`), a built-in
+  preset later.

@@ -37,6 +37,11 @@ mathfmt [OPTIONS] [FILE...]
         --check               exit 1 if any file would change; print their names
         --diff                print a unified diff per changed file
         --emit KIND           regions | tokens | atoms | symbols, as JSON lines
+        --verify              compile before and after, compare the rendered pages
+        --engine PROGRAM      the TeX engine --verify uses (default pdflatex)
+        --preamble FILE       preamble for snippets under --verify
+        --dpi N               resolution of the page comparison (default 100)
+        --keep DIR            keep the --verify build trees
         --format text|json    diagnostics format (default text)
         --strict              warnings make the exit status 1
     -j, --jobs N              parallel files (default: available cores)
@@ -53,12 +58,52 @@ mathfmt --profile unicode --write sections/*.tex
 mathfmt --check --diff main.tex sections/*.tex
 mathfmt --emit symbols main.tex | jq -r .atom | sort | uniq -c
 mathfmt rename --from 𝔉 --to ℱ --write sections/*.tex
+mathfmt --verify --macros ddssm.sty main.tex sections/*.tex
 ```
 
-Exit status: 0 clean; 1 `--check` found changes or `--strict` found warnings;
-2 usage, config or I/O error. Silent on success. With no FILE it reads stdin,
-so guard a shell expansion that may come back empty; a pre-commit hook passes
-the files itself.
+Exit status: 0 clean; 1 `--check` found changes, `--strict` found warnings or
+`--verify` found a difference; 2 usage, config or I/O error. Silent on
+success. With no FILE it reads stdin, so guard a shell expansion that may come
+back empty; a pre-commit hook passes the files itself.
+
+### Proving a conversion is safe
+
+The promise is the same PDF from different source, and `--verify` checks it
+rather than arguing it: the original and the converted source are compiled
+with the same engine, both PDFs are rasterized with `pdftoppm`, and the pages
+are compared pixel for pixel. Text extraction cannot tell a bold `x` from a
+plain one; pixels can. A FILE with `\documentclass` is a document and is
+compiled as it is, under its own preamble, with the converted copies of the
+other FILEs in place:
+
+```
+$ mathfmt --verify --macros ddssm.sty main.tex sections/*.tex
+broken: main.tex: the converted source does not compile
+  ! LaTeX Error: Unicode character 𝐱 (U+1D431)
+                 not set up for use with LaTeX.
+```
+
+That is the honest answer for a pdflatex paper whose preamble does not load
+`unicode-math-input`: it is not safe to convert yet. With the package added,
+the same paper gives
+
+```
+differs: main.tex: 1 of 8 pages
+  page 3: 1717 pixels in the box x=137..281 y=753..849
+  text before: + 1[learnable µp ] Rµp .
+  text after:  + ⊮[learnable µp ] Rµp .
+```
+
+because unicode-math-input reads `𝟙` as `\mathbb{1}`, which in amsfonts is the
+glyph ⊮, where the paper wrote `\mathbbm{1}`; one
+`\umiDeclareMathChar{𝟙}{\mathbbm{1}}` in the preamble closes it. Every other
+page of the paper renders identically.
+
+A FILE without `\documentclass` is a snippet and is wrapped in a preamble
+(`--preamble FILE`, or a built-in one that loads the usual packages and
+unicode-math-input and declares the styled letters the snippet uses to mean
+what the `ascii` profile spells them as). `--verify` needs the engine and
+`pdftoppm` on PATH; the test suite runs it over every fixture.
 
 A project's `mathfmt.toml` names the definition files whose macros the tool
 reads and the profiles it may emit; two profiles, `unicode` and `ascii`, exist
@@ -123,6 +168,16 @@ configurable:
   Greek. Bold upright `𝛂` and bold italic `𝜶` therefore both become
   `\boldsymbol{\alpha}` and come back as `𝜶`. Set `style_commands.bf_greek =
   "\\mathbf"` for the literal reading.
+- **ℑ and ℜ.** Unicode has one codepoint each for the fraktur I and R and for
+  the imaginary and real parts, so `\mathfrak{I}` and `\Im` are one atom. The
+  `ascii` profile spells it `\Im`; pdflatex draws `\mathfrak{I}` from eufm and
+  `\Im` from cmsy, and they look different. Set `spellings."frak:I" =
+  "\\mathfrak{I}"` (and `frak:R`) for a paper that means the letter.
+
+`\mathbb{1}` is not a collapse but a repair: amsfonts has no blackboard digits
+and `\mathbb{1}` is the glyph ⊮, so the `bb_digit` key spells `𝟙` as
+`\mathbbm{1}`. `--verify` reports each of these as a difference when a
+conversion crosses one, which is how they were found.
 
 ## Developing
 
