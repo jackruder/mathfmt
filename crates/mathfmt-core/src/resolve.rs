@@ -23,12 +23,39 @@ pub enum OccKind {
     MacroCall,
 }
 
+/// One piece of a structured occurrence: the i-th atom, or structure copied
+/// from the source (`_`, `^`, `{`, `}`) that the style command reached
+/// across.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    Atom(usize),
+    Text(String),
+}
+
 /// A stretch of source that stands for one or more atoms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Occurrence {
     pub span: Span,
     pub atoms: Vec<Atom>,
     pub kind: OccKind,
+    /// How the atoms sit in the source: empty for a flat occurrence (the
+    /// atoms in order with nothing between), else the atoms interleaved with
+    /// the scripts and braces of a style group such as `\mathbf{x_1}`.
+    pub parts: Vec<Part>,
+}
+
+impl Occurrence {
+    pub fn is_flat(&self) -> bool {
+        self.parts.is_empty()
+    }
+}
+
+fn push_text(parts: &mut Vec<Part>, text: &str) {
+    if let Some(Part::Text(last)) = parts.last_mut() {
+        last.push_str(text);
+    } else {
+        parts.push(Part::Text(text.to_string()));
+    }
 }
 
 pub fn resolve(
@@ -97,6 +124,7 @@ impl<'a> Resolver<'a> {
                         span: t.span,
                         atoms: vec![self.read_style(atom)],
                         kind: OccKind::Char,
+                        parts: Vec::new(),
                     });
                     return true;
                 }
@@ -110,6 +138,7 @@ impl<'a> Resolver<'a> {
                         span: t.span,
                         atoms: vec![atom],
                         kind: OccKind::Name,
+                        parts: Vec::new(),
                     });
                     true
                 } else {
@@ -170,6 +199,7 @@ impl<'a> Resolver<'a> {
                     span: c.name.span,
                     atoms: vec![atom],
                     kind: OccKind::Name,
+                    parts: Vec::new(),
                 });
                 return true;
             }
@@ -212,42 +242,86 @@ impl<'a> Resolver<'a> {
             Node::Group(g) => g.children.iter().collect(),
             other => vec![other],
         };
-        let mut bases = Vec::new();
-        for child in children {
-            if let Node::Leaf(t) = child {
-                if t.kind == TokKind::Trivia {
-                    continue;
-                }
-            }
-            match self.base_of(child) {
-                Some(b) => bases.push(b),
-                None => {
-                    self.diags.push(Diagnostic::info(
-                        "style-group-left-whole",
-                        c.name.span.start,
-                        format!(
-                            "{} holds more than letters, digits and Greek; left as written",
-                            Span::new(c.name.span.start, c.end).text(self.src)
-                        ),
-                    ));
-                    return false;
-                }
-            }
+        let mut atoms = Vec::new();
+        let mut parts = Vec::new();
+        if !self.distribute(&children, style, &mut atoms, &mut parts) {
+            self.diags.push(Diagnostic::info(
+                "style-group-left-whole",
+                c.name.span.start,
+                format!(
+                    "{} holds more than letters, digits, Greek, scripts and braces; left as written",
+                    Span::new(c.name.span.start, c.end).text(self.src)
+                ),
+            ));
+            return false;
         }
-        if bases.is_empty() {
+        if atoms.is_empty() {
             return false;
         }
         // An upright group of ASCII letters or digits (`\mathrm{Var}`,
         // `\mathrm{d}`) is an operator word, not a symbol: it has no Unicode
         // form and is never rewritten or counted.
-        if style == Style::Up && bases.iter().any(char::is_ascii_alphanumeric) {
+        let ascii_base =
+            |a: &Atom| matches!(a, Atom::Styled { base, .. } if base.is_ascii_alphanumeric());
+        if style == Style::Up && atoms.iter().any(ascii_base) {
             return false;
+        }
+        // Only scripts and braces make the occurrence structured; a run of
+        // bases is flat and merges with its neighbours.
+        if !parts.iter().any(|p| matches!(p, Part::Text(_))) {
+            parts.clear();
         }
         out.push(Occurrence {
             span: Span::new(c.name.span.start, c.end),
-            atoms: bases.into_iter().map(|b| Atom::styled(b, style)).collect(),
+            atoms,
             kind: OccKind::StyledGroup,
+            parts,
         });
+        true
+    }
+
+    /// Apply `style` to every base under a style command, as TeX does: the
+    /// alphabet reaches through scripts and braces, so `\mathbf{x_1}` is bold
+    /// `x` and bold `1`. Whitespace between bases means nothing in math and
+    /// is dropped. Anything else inside (an operator, a comma, another
+    /// command, a comment) stops the distribution and the group is left whole.
+    fn distribute(
+        &self,
+        nodes: &[&Node],
+        style: Style,
+        atoms: &mut Vec<Atom>,
+        parts: &mut Vec<Part>,
+    ) -> bool {
+        for node in nodes {
+            match node {
+                Node::Leaf(t) if t.kind == TokKind::Trivia => {
+                    if t.text(self.src).contains('%') {
+                        return false;
+                    }
+                }
+                Node::Leaf(t) if matches!(t.kind, TokKind::Sup | TokKind::Sub) => {
+                    push_text(parts, t.text(self.src));
+                }
+                Node::Group(g) => {
+                    if g.close.is_none() {
+                        return false;
+                    }
+                    push_text(parts, "{");
+                    let children: Vec<&Node> = g.children.iter().collect();
+                    if !self.distribute(&children, style, atoms, parts) {
+                        return false;
+                    }
+                    push_text(parts, "}");
+                }
+                other => match self.base_of(other) {
+                    Some(b) => {
+                        parts.push(Part::Atom(atoms.len()));
+                        atoms.push(Atom::styled(b, style));
+                    }
+                    None => return false,
+                },
+            }
+        }
         true
     }
 
@@ -337,10 +411,36 @@ impl<'a> Resolver<'a> {
             walk_args(self, out);
             return false;
         }
+        // Concatenate the expansion's occurrences, renumbering the parts of
+        // any structured one.
+        let mut atoms: Vec<Atom> = Vec::new();
+        let mut parts: Vec<Part> = Vec::new();
+        let mut structured = false;
+        for o in inner {
+            let offset = atoms.len();
+            if o.is_flat() {
+                for i in 0..o.atoms.len() {
+                    parts.push(Part::Atom(offset + i));
+                }
+            } else {
+                structured = true;
+                for p in o.parts {
+                    match p {
+                        Part::Atom(i) => parts.push(Part::Atom(offset + i)),
+                        Part::Text(t) => push_text(&mut parts, &t),
+                    }
+                }
+            }
+            atoms.extend(o.atoms);
+        }
+        if !structured {
+            parts.clear();
+        }
         out.push(Occurrence {
             span: Span::new(c.name.span.start, c.end),
-            atoms: inner.into_iter().flat_map(|o| o.atoms).collect(),
+            atoms,
             kind: OccKind::MacroCall,
+            parts,
         });
         true
     }
@@ -397,22 +497,52 @@ mod tests {
     }
 
     #[test]
-    fn impure_style_groups_are_left_whole() {
-        let (occ, diags, src) =
-            run(r"$\mathbf{\sigma_\theta} + \mathrm{Var} + \mathrm{d}x + \mathrm{\alpha}$");
+    fn style_groups_distribute_through_scripts_and_braces() {
+        let (occ, diags, src) = run(
+            r"$\mathbf{\sigma_\theta} + \bm{\mu_k^{2}} + \mathbf{x+y} + \mathrm{Var} + \mathrm{d}x + \mathrm{\alpha} + \mathrm{x_1}$",
+        );
         assert_eq!(
             show(&occ, &src),
-            vec![(r"\mathrm{\alpha}".into(), "up:α".into())],
-            "upright ASCII words are operator names, not symbols; upright Greek is a symbol"
+            vec![
+                (r"\mathbf{\sigma_\theta}".into(), "bf:σ bf:θ".into()),
+                (r"\bm{\mu_k^{2}}".into(), "bfit:μ bfit:k bfit:2".into()),
+                (r"\mathrm{\alpha}".into(), "up:α".into()),
+            ],
+            "scripts and braces are reached across; an operator stops it; upright ASCII words are operator names"
         );
+        assert_eq!(
+            occ[1].parts,
+            vec![
+                Part::Atom(0),
+                Part::Text("_".into()),
+                Part::Atom(1),
+                Part::Text("^{".into()),
+                Part::Atom(2),
+                Part::Text("}".into()),
+            ]
+        );
+        assert!(occ[2].is_flat());
         assert_eq!(
             diags
                 .iter()
                 .filter(|d| d.code == "style-group-left-whole")
                 .count(),
             1,
-            "only the mixed group is reported"
+            "only \\mathbf{{x+y}} is reported"
         );
+    }
+
+    #[test]
+    fn a_macro_over_a_structured_group_inlines() {
+        let (occ, _, src) = run("\\newcommand{\\vect}[1]{\\mathbf{#1}} $\\vect{x_t} \\vect{x}$");
+        assert_eq!(
+            show(&occ, &src),
+            vec![
+                (r"\vect{x_t}".into(), "bf:x bf:t".into()),
+                (r"\vect{x}".into(), "bf:x".into()),
+            ]
+        );
+        assert!(!occ[0].is_flat() && occ[1].is_flat());
     }
 
     #[test]

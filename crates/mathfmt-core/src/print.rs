@@ -6,7 +6,7 @@ use crate::atom::{Atom, Style};
 use crate::config::{Form, Profile};
 use crate::diag::Diagnostic;
 use crate::lex::Span;
-use crate::resolve::Occurrence;
+use crate::resolve::{Occurrence, Part};
 use crate::table::Table;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub fn plan(
     // First pass: a replacement per occurrence, or none.
     let mut planned: Vec<(Span, Option<String>)> = Vec::with_capacity(occurrences.len());
     for occ in &occurrences {
-        match spell_atoms(&occ.atoms, profile, table) {
+        match spell_occurrence(occ, profile, table) {
             Ok(text) => planned.push((occ.span, Some(text))),
             Err(atom) => {
                 diags.push(Diagnostic::warning(
@@ -68,7 +68,7 @@ pub fn plan(
         if ends_with_control_word(before) && starts_alphabetic(&text) {
             text.insert(0, ' ');
         }
-        if is_script_operand(&src[..span.start]) && !text.starts_with('{') && !text.is_ascii() {
+        if is_script_operand(&src[..span.start]) && needs_script_braces(&text) {
             text = format!("{{{text}}}");
         }
         // what comes just after
@@ -120,7 +120,7 @@ fn apply_rename(occurrences: &[Occurrence], rename: &RenameMap) -> Vec<Occurrenc
         .collect()
 }
 
-/// Under a LaTeX styled form, adjacent occurrences of one style share a
+/// Under a LaTeX styled form, adjacent flat occurrences of one style share a
 /// wrapper: `𝐱𝐲` → `\mathbf{xy}`, `\mathbf{x}\mathbf{y}` → `\mathbf{xy}`.
 fn merge_runs(occurrences: Vec<Occurrence>, profile: &Profile) -> Vec<Occurrence> {
     if profile.styled != Form::Latex {
@@ -129,7 +129,11 @@ fn merge_runs(occurrences: Vec<Occurrence>, profile: &Profile) -> Vec<Occurrence
     let mut out: Vec<Occurrence> = Vec::with_capacity(occurrences.len());
     for occ in occurrences {
         if let Some(last) = out.last_mut() {
-            if last.span.end == occ.span.start && same_single_style(&last.atoms, &occ.atoms) {
+            if last.is_flat()
+                && occ.is_flat()
+                && last.span.end == occ.span.start
+                && same_single_style(&last.atoms, &occ.atoms)
+            {
                 last.span = last.span.join(occ.span);
                 last.atoms.extend(occ.atoms);
                 continue;
@@ -173,6 +177,77 @@ enum Piece {
     Plain(String),
 }
 
+impl Piece {
+    fn render(&self) -> String {
+        match self {
+            Piece::Plain(t) => t.clone(),
+            Piece::Wrapper { command, bases } => wrap(command, bases),
+        }
+    }
+}
+
+/// `\mathbf{xy}`, or the template filled in when the command holds `#1`.
+fn wrap(command: &str, bases: &str) -> String {
+    if command.contains("#1") {
+        command.replace("#1", bases)
+    } else {
+        format!("{command}{{{bases}}}")
+    }
+}
+
+/// Spell one occurrence: a flat one as its atoms in a row, a structured one
+/// (a style group with scripts or braces inside) by filling its atoms back
+/// into the structure. Under a LaTeX styled form, when every atom wants the
+/// same wrapper, one wrapper encloses the whole structure as the source had
+/// it (`\bm{\mu_k}` stays `\bm{\mu_k}`); otherwise each atom is spelled on
+/// its own inside the structure (`\mathbf{\sigma_x}` →
+/// `\boldsymbol{\sigma}_{\mathbf{x}}`, `𝛔_{𝛉}`).
+fn spell_occurrence(occ: &Occurrence, profile: &Profile, table: &Table) -> Result<String, Atom> {
+    if occ.is_flat() {
+        return spell_atoms(&occ.atoms, profile, table);
+    }
+    let pieces = occ
+        .atoms
+        .iter()
+        .map(|a| spell_one(a, profile, table))
+        .collect::<Result<Vec<_>, _>>()?;
+    let shared: Option<&str> = match pieces.first() {
+        Some(Piece::Wrapper { command, .. })
+            if pieces
+                .iter()
+                .all(|p| matches!(p, Piece::Wrapper { command: c, .. } if c == command)) =>
+        {
+            Some(command)
+        }
+        _ => None,
+    };
+    let mut body = String::new();
+    for part in &occ.parts {
+        let text = match part {
+            Part::Text(t) => t.clone(),
+            Part::Atom(i) => match (&pieces[*i], shared) {
+                (Piece::Wrapper { bases, .. }, Some(_)) => bases.clone(),
+                (piece, _) => {
+                    let t = piece.render();
+                    if is_script_operand(&body) && needs_script_braces(&t) {
+                        format!("{{{t}}}")
+                    } else {
+                        t
+                    }
+                }
+            },
+        };
+        if ends_with_control_word(&body) && starts_alphabetic(&text) {
+            body.push(' ');
+        }
+        body.push_str(&text);
+    }
+    Ok(match shared {
+        Some(command) => wrap(command, &body),
+        None => body,
+    })
+}
+
 /// Spell a sequence of atoms. `Err(atom)` names the first atom with no
 /// spelling under this profile.
 fn spell_atoms(atoms: &[Atom], profile: &Profile, table: &Table) -> Result<String, Atom> {
@@ -200,16 +275,7 @@ fn spell_atoms(atoms: &[Atom], profile: &Profile, table: &Table) -> Result<Strin
     }
     let mut out = String::new();
     for p in pieces {
-        let text = match p {
-            Piece::Plain(t) => t,
-            Piece::Wrapper { command, bases } => {
-                if command.contains("#1") {
-                    command.replace("#1", &bases)
-                } else {
-                    format!("{command}{{{bases}}}")
-                }
-            }
-        };
+        let text = p.render();
         if ends_with_control_word(&out) && starts_alphabetic(&text) {
             out.push(' ');
         }
@@ -313,6 +379,13 @@ fn is_script_operand(before: &str) -> bool {
     trimmed.ends_with('^') || trimmed.ends_with('_')
 }
 
+/// A script operand that is a multi-byte character (pdflatex reads it a byte
+/// at a time) or a command with an argument (`x_\boldsymbol{\theta}` is
+/// "Missing { inserted") needs braces; a bare control word or ASCII does not.
+fn needs_script_braces(text: &str) -> bool {
+    !text.starts_with('{') && (!text.is_ascii() || text.contains('{'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +454,41 @@ mod tests {
             out,
             r"$\mathbf{xy} \mathbf{xy} \mathbf{x}_t\mathbf{y} \mathbf{x}\boldsymbol{\alpha}$"
         );
+    }
+
+    #[test]
+    fn style_groups_distribute_to_unicode_and_back() {
+        let src = r"$\mathbf{\sigma_\theta} \bm{\mu_k^{2}} \mathbf{x_1} \mathbf{x+y} x_\mathbf{y}$";
+        let (uni, _) = convert(src, "unicode");
+        assert_eq!(
+            uni, "$𝛔_{𝛉} 𝝁_{𝒌}^{\\boldsymbol{2}} 𝐱_{𝟏} \\mathbf{x+y} x_{𝐲}$",
+            "Unicode has bold digits but no bold italic ones, so that 2 keeps its wrapper"
+        );
+        let (asc, _) = convert(&uni, "ascii");
+        assert_eq!(
+            asc,
+            r"$\boldsymbol{\sigma}_{\boldsymbol{\theta}} \boldsymbol{\mu}_{\boldsymbol{k}}^{\boldsymbol{2}} \mathbf{x}_{\mathbf{1}} \mathbf{x+y} x_{\mathbf{y}}$"
+        );
+        let (direct, _) = convert(src, "ascii");
+        assert_eq!(
+            direct,
+            r"$\boldsymbol{\sigma_\theta} \boldsymbol{\mu_k^{2}} \mathbf{x_1} \mathbf{x+y} x_\mathbf{y}$",
+            "one wrapper when every base wants the same one; untouched when already right"
+        );
+        let (mixed, _) = convert(r"$\mathbf{\sigma_x} \mathfrak{I_x}$", "ascii");
+        assert_eq!(
+            mixed, r"$\boldsymbol{\sigma}_{\mathbf{x}} \Im_{\mathfrak{x}}$",
+            "different wrappers inside one group are spelled one by one"
+        );
+        for out in [&uni, &asc, &direct, &mixed] {
+            let p = if out.contains('𝛔') {
+                "unicode"
+            } else {
+                "ascii"
+            };
+            let (again, _) = convert(out, p);
+            assert_eq!(&again, out, "idempotent under {p}");
+        }
     }
 
     #[test]

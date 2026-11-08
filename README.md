@@ -76,13 +76,18 @@ mathfmt --check --diff --macros ddssm.sty main.tex sections/*.tex
 | | |
 |---|---|
 | time for all eight files | about 25 ms |
-| symbol occurrences rewritten | 677 |
+| symbol occurrences rewritten | 679 |
 | distinct symbols | 48 |
 | warnings | 0 |
-| style groups left as written (`\mathbf{\sigma_\theta}`) | 2, reported with `-v` |
+| style groups left as written | 0 |
 
-The result taken through `--profile ascii` and back to `unicode` returns every
-file byte for byte. A line of the diff:
+The result taken through `--profile ascii` and back to `unicode` returns seven
+of the eight files byte for byte. The eighth writes `\mathbf{\sigma_\theta}`,
+which pdflatex renders as plain italic (its `\mathbf` ignores lowercase Greek);
+mathfmt reads it literally as bold upright `𝛔_{𝛉}`, and the `ascii` profile
+spells bold Greek with `\boldsymbol`, which reads back as bold italic `𝝈_{𝜽}`.
+A profile with `bf_greek = "\\mathbf"` keeps pdflatex's reading and closes the
+round trip; see "Known collapses" below. A line of the diff:
 
 ```diff
 -Let \( \mathbf{x}_{1:T} = (\mathbf{x}_1, \dots, \mathbf{x}_T) \) with \( \mathbf{x}_t \in \mathbb{R}^D \)

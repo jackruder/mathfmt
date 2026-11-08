@@ -29,7 +29,7 @@ pub use lex::Span;
 pub use macros::{Macro, MacroTable};
 pub use parse::{scan, Document, MathRegion, Node, RegionKind, ScanOptions};
 pub use print::{Edit, RenameMap};
-pub use resolve::{OccKind, Occurrence};
+pub use resolve::{OccKind, Occurrence, Part};
 pub use signatures::Signatures;
 pub use table::Table;
 

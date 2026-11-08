@@ -546,3 +546,39 @@ Fifteen findings; all accepted.
   config.
 - The README's staged-files example read stdin when nothing was staged; the
   example names files and the stdin fallback is stated next to the exit codes.
+
+### 2026-11-08, style distribution
+
+- **§8.3 and §8.4, style groups.** A style command's alphabet reaches through
+  scripts and braces, as it does in TeX: `\mathbf{\sigma_\theta}` is bold `σ`
+  and bold `θ`, `\mathbb{R^n}` is `ℝ^{𝕟}`, `\bm{\mu_k}` is `𝝁_{𝒌}`. The
+  resolver applies the style to every base inside the group and keeps the
+  scripts and braces as structure (an occurrence now carries `parts`, the atoms
+  interleaved with that structure; a run of bases is flat as before).
+  Whitespace inside the group is dropped, as math ignores it. A group that
+  holds anything else (an operator, punctuation, another command, a comment)
+  is still left whole, with the same informational diagnostic; those are the
+  cases where TeX's result is not a sequence of styled letters. The upright
+  rule of 2026-11-05 is unchanged: `\mathrm{x_1}` is an operator word.
+- **§9, printing a structured group.** Under `styled = "latex"`, when every
+  atom in the structure wants the same wrapper, one wrapper encloses the
+  structure as the source had it (`\bm{\mu_k}` stays `\bm{\mu_k}`;
+  `\mathbf{\sigma_\theta}` becomes `\boldsymbol{\sigma_\theta}` by the
+  `bf_greek` key). Otherwise each atom is spelled on its own inside the
+  structure: `\mathbf{\sigma_x}` → `\boldsymbol{\sigma}_{\mathbf{x}}`,
+  `\mathfrak{I_x}` → `\Im_{\mathfrak{x}}`. Under `unicode`, each base becomes
+  its character: `𝛔_{𝛉}`. Structured occurrences never merge with their
+  neighbours.
+- **§9, script braces for wrappers.** A replacement that is a command with an
+  argument and stands as the operand of `^` or `_` is wrapped in braces, like
+  a multi-byte character: `x_\boldsymbol{\theta}` is a fatal "Missing {
+  inserted" in pdflatex, so `𝐱_𝐲` → `\mathbf{x}_{\mathbf{y}}`. A bare control
+  word (`x^\alpha`) is left bare as before.
+- **§14, the round trip and the paper.** Distribution converts the two groups
+  the smoke test used to leave whole, and exposes the `bf_greek` collapse of
+  §17 on real text: `\mathbf{\sigma_\theta}` → `𝛔_{𝛉}` → ascii
+  `\boldsymbol{\sigma}_{\boldsymbol{\theta}}` → `𝝈_{𝜽}`, bold italic where
+  the source had bold upright. The round trip over the paper now returns seven
+  files of eight; a paper that wants it closed under pdflatex's reading of
+  bold Greek sets `bf_greek = "\\mathbf"` in its profile. The compile-and-
+  compare check of §13 is what decides such questions from here on.
