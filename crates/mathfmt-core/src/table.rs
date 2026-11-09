@@ -1,10 +1,11 @@
 //! The symbol tables, embedded from `data/` and parsed once.
 //!
-//! Four files (see the design, §12):
+//! Five files (see the design, §12):
 //! - `unicode-math.tsv`: every row of unicode-math's table.
 //! - `alphabets.tsv`: codepoint → (style, base) for styled letters and digits.
 //! - `greek.tsv`: the plain Greek letters LaTeX names.
 //! - `latex.tsv`: the curated ASCII spellings and input aliases.
+//! - `packages.tsv`: which package defines each command of a spelling.
 
 use std::collections::HashMap;
 
@@ -14,6 +15,7 @@ const UNICODE_MATH: &str = include_str!("../data/unicode-math.tsv");
 const ALPHABETS: &str = include_str!("../data/alphabets.tsv");
 const GREEK: &str = include_str!("../data/greek.tsv");
 const LATEX: &str = include_str!("../data/latex.tsv");
+const PACKAGES: &str = include_str!("../data/packages.tsv");
 
 /// Math classes whose codepoints are symbols an author types, as opposed to
 /// accents and over/under marks that take an argument.
@@ -53,6 +55,8 @@ pub struct Table {
     info: HashMap<char, SymbolInfo>,
     /// Plain Greek codepoints LaTeX has a name for.
     greek_names: HashMap<char, String>,
+    /// Control-word name → what defines it: `kernel`, a package, or `-`.
+    packages: HashMap<String, String>,
 }
 
 impl Table {
@@ -63,7 +67,13 @@ impl Table {
             codepoint: HashMap::new(),
             info: HashMap::new(),
             greek_names: HashMap::new(),
+            packages: HashMap::new(),
         };
+        for row in Self::rows(PACKAGES) {
+            if let [name, package] = row[..] {
+                t.packages.insert(name.to_string(), package.to_string());
+            }
+        }
         t.load_unicode_math(UNICODE_MATH);
         t.load_alphabets(ALPHABETS);
         t.load_greek(GREEK);
@@ -222,6 +232,22 @@ impl Table {
         self.info.get(&cp).and_then(|i| i.latex.as_deref())
     }
 
+    /// The package a command needs (`mathbbm` → `bbm`, `leqslant` →
+    /// `amssymb`); `None` for a kernel command and for one the table does
+    /// not list. `-` marks a command no package the generator tried defines.
+    pub fn package_of(&self, command: &str) -> Option<&str> {
+        self.packages
+            .get(command)
+            .map(String::as_str)
+            .filter(|p| *p != "kernel")
+    }
+
+    /// What `packages.tsv` says defines a command: `kernel`, a package, or
+    /// `-` for none the generator tried; `None` when it has no row.
+    pub fn defined_by(&self, command: &str) -> Option<&str> {
+        self.packages.get(command).map(String::as_str)
+    }
+
     /// True when the atom is a plain Greek letter LaTeX can name.
     pub fn is_greek_letter(&self, atom: &Atom) -> bool {
         match atom {
@@ -260,6 +286,33 @@ mod tests {
         assert!(t.len() > 1500, "{} atoms", t.len());
     }
 
+    /// `packages.tsv` is asked of TeX, so this is the independent check of
+    /// the hand-written `latex.tsv`: every command a spelling emits is
+    /// defined by the kernel or by a package the table can name.
+    #[test]
+    fn every_spelling_is_defined_somewhere() {
+        let t = Table::builtin();
+        let mut checked = 0;
+        for (_, atom) in t.all_atoms() {
+            let Some(spelling) = t.latex_of(&atom) else {
+                continue;
+            };
+            for tok in crate::lex::lex_all(spelling) {
+                if tok.kind != crate::lex::TokKind::ControlWord {
+                    continue;
+                }
+                let name = tok.name(spelling);
+                let source = t.defined_by(name);
+                assert!(
+                    source.is_some_and(|s| s != "-"),
+                    "\\{name} (in `{spelling}`) has no row in packages.tsv, or none that defines it; run tools/gen-packages.py"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 300, "{checked} commands checked");
+    }
+
     #[test]
     fn spec_examples() {
         let t = Table::builtin();
@@ -296,6 +349,13 @@ mod tests {
         assert_eq!(t.latex_of(&Atom::styled('I', Style::Frak)), Some("\\Im"));
         assert!(t.is_greek_letter(&Atom::Named('α')));
         assert!(!t.is_greek_letter(&Atom::Named('∈')));
+        // where a spelling's command comes from
+        assert_eq!(t.package_of("in"), None, "the kernel defines \\in");
+        assert_eq!(t.package_of("mathbb"), Some("amsfonts"));
+        assert_eq!(t.package_of("leqslant"), Some("amssymb"));
+        assert_eq!(t.package_of("mathbbm"), Some("bbm"));
+        assert_eq!(t.package_of("boldsymbol"), Some("amsmath"));
+        assert_eq!(t.package_of("symbfup"), Some("unicode-math"));
         // a symbol unicode-math knows but LaTeX has no name for
         assert_eq!(t.atom_of_char('∆'), Some(Atom::Named('∆')));
         assert_eq!(t.latex_of(&Atom::Named('∆')), None);

@@ -1,0 +1,10 @@
+% packages the notation's commands need and the preamble does not load
+\usepackage{unicode-math-input}
+% styled letters, as the profile spells them (unicode-math-input follows pdflatex, which has no bold Greek under \mathbf and no blackboard digits)
+\umiDeclareMathChar{ℝ}{\mathbb{R}}
+\umiDeclareMathChar{𝐖}{\mathbf{W}}
+\umiDeclareMathChar{𝐱}{\mathbf{x}}
+\umiDeclareMathChar{𝒩}{\mathcal{N}}
+\umiDeclareMathChar{𝔼}{\mathbb{E}}
+\umiDeclareMathChar{𝝈}{\boldsymbol{\sigma}}
+\umiDeclareMathChar{𝟙}{\mathbbm{1}}

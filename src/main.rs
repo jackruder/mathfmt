@@ -3,18 +3,19 @@
 //! Reads LaTeX on stdin and writes it on stdout, or takes files. See
 //! `mathfmt --help` and the design in `docs/superpowers/specs/`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 
 use mathfmt_core::lex::lex_all;
 use mathfmt_core::{
-    Atom, Config, Diagnostic, Engine, Level, LineIndex, Outcome, Profile, RegionKind, RenameMap,
+    Atom, Config, Diagnostic, Engine, Level, LineIndex, Mechanism, Outcome, Profile, RegionKind,
+    RenameMap,
 };
 
 mod verify;
@@ -24,6 +25,7 @@ mod verify;
 #[command(
     after_help = "Exit status: 0 clean; 1 --check found changes, --strict found warnings or --verify found a difference; 2 usage, config or I/O error.\n\
 With no FILE, reads stdin and writes stdout. With FILEs and none of --write, --check, --diff, --emit or --verify, writes each converted file to stdout in turn.\n\
+--project takes the files from a root document: every file it reads with \\input or \\include. The root is the FILE, else --root, else `root` in mathfmt.toml. With a root, named either way, the definitions of its preamble and of the local packages it loads are in force for every file.\n\
 --verify compiles the original and the converted source with the same engine and compares the rendered pages pixel for pixel. A FILE holding \\documentclass is a document, compiled as it is with the converted copies of the other FILEs in place; without one, each FILE is a snippet wrapped in a preamble. Needs the engine and pdftoppm on PATH."
 )]
 struct Cli {
@@ -53,10 +55,28 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Print the preamble lines the notation needs: the packages its
+    /// commands come from and a meaning for each Unicode character
+    Declarations {
+        #[command(flatten)]
+        select: Select,
+        /// How the document reads Unicode math (default: `unicode_input`
+        /// in the config, else what the root's preamble says)
+        #[arg(long = "with", value_enum, value_name = "MECHANISM")]
+        with: Option<With>,
+    },
+    /// Print what project mode reads from a root document
+    Project {
+        /// The root document (default: `root` in mathfmt.toml)
+        root: Option<PathBuf>,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
+/// Which files, read under which config, profile and definitions.
 #[derive(Args, Clone)]
-struct RunArgs {
+struct Select {
     /// LaTeX files to convert; none means stdin to stdout
     files: Vec<PathBuf>,
     /// Profile from the config (default: the config's `profile`)
@@ -68,8 +88,22 @@ struct RunArgs {
     /// An extra file to read macro definitions from (repeatable)
     #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
     macros: Vec<PathBuf>,
+    /// FILEs are root documents: take every file each one inputs. With no
+    /// FILE, the root is --root, else `root` in mathfmt.toml
+    #[arg(long)]
+    project: bool,
+    /// The root document of the FILEs: its preamble's packages and
+    /// definitions apply to them (default: `root` in mathfmt.toml)
+    #[arg(long, value_name = "FILE")]
+    root: Option<PathBuf>,
+}
+
+#[derive(Args, Clone)]
+struct RunArgs {
+    #[command(flatten)]
+    select: Select,
     /// Rewrite FILEs in place (through a symlink to its target)
-    #[arg(short, long, requires = "files", conflicts_with_all = ["check", "diff", "emit"])]
+    #[arg(short, long, conflicts_with_all = ["check", "diff", "emit"])]
     write: bool,
     /// Exit 1 if any file would change, and name it; write nothing
     #[arg(long)]
@@ -84,14 +118,14 @@ struct RunArgs {
     /// verdict per document or snippet, exit 1 on a difference
     #[arg(long, conflicts_with_all = ["write", "check", "diff", "emit"])]
     verify: bool,
-    /// The TeX engine --verify compiles with
-    #[arg(
-        long,
-        value_name = "PROGRAM",
-        default_value = "pdflatex",
-        requires = "verify"
-    )]
-    engine: String,
+    /// The TeX engine --verify compiles with (default: `engine` in the
+    /// config, else what the root's preamble says, else pdflatex)
+    #[arg(long, value_name = "PROGRAM", requires = "verify")]
+    engine: Option<String>,
+    /// Under --verify, add what `mathfmt declarations` prints to a
+    /// document's preamble, on both sides
+    #[arg(long, requires = "verify")]
+    declare: bool,
     /// Preamble for snippets under --verify (default: built in, per engine)
     #[arg(long, value_name = "FILE", requires = "verify")]
     preamble: Option<PathBuf>,
@@ -132,11 +166,34 @@ enum Format {
     Json,
 }
 
+/// How the document reads Unicode math characters.
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum With {
+    /// pdflatex with the unicode-math-input package
+    UnicodeMathInput,
+    /// pdflatex with the kernel's \DeclareUnicodeCharacter alone
+    Kernel,
+    /// lualatex or xelatex with unicode-math
+    UnicodeMath,
+}
+
+impl From<With> for Mechanism {
+    fn from(w: With) -> Mechanism {
+        match w {
+            With::UnicodeMathInput => Mechanism::UnicodeMathInput,
+            With::Kernel => Mechanism::Kernel,
+            With::UnicodeMath => Mechanism::UnicodeMath,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Table { profile, config }) => table(profile, config),
         Some(Command::Rename { from, to, run }) => convert(run, Some((from, to))),
+        Some(Command::Declarations { select, with }) => declarations(select, with),
+        Some(Command::Project { root, config }) => project(root, config),
         None => convert(cli.run, None),
     };
     match result {
@@ -184,12 +241,156 @@ fn locate_config(explicit: Option<&Path>, near: &Path) -> Result<(Option<PathBuf
     Ok((path, config))
 }
 
-fn build_engine(config: Config, macros: &[PathBuf]) -> Result<Engine> {
-    let mut engine = Engine::new(config)?;
-    for m in macros {
-        engine.add_macro_file(m)?;
+/// The inputs that share a config and a root, with the engine built for them.
+struct Group {
+    engine: Engine,
+    profile: Profile,
+    /// Indices into the inputs.
+    indices: Vec<usize>,
+}
+
+/// What a command line selects: the inputs, grouped by the engine that
+/// converts them.
+struct Loaded {
+    inputs: Vec<Input>,
+    groups: Vec<Group>,
+    /// The group of each input.
+    group_of: Vec<usize>,
+}
+
+struct Loader<'a> {
+    select: &'a Select,
+    cwd: PathBuf,
+    /// (config file, root document) → group.
+    index: BTreeMap<(Option<PathBuf>, Option<PathBuf>), usize>,
+    groups: Vec<Group>,
+}
+
+impl Loader<'_> {
+    /// A path under the current directory, as the user would name it.
+    fn pretty(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.cwd)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
     }
-    Ok(engine)
+
+    /// The directory a file's config is looked up from.
+    fn near(&self, file: &Path) -> PathBuf {
+        match file.parent() {
+            Some(d) if !d.as_os_str().is_empty() => self.cwd.join(d),
+            _ => self.cwd.clone(),
+        }
+    }
+
+    /// The group for files near `near`, under `root` when the caller names
+    /// one, else `--root`, else the config's `root`, else none.
+    fn group(&mut self, near: &Path, root: Option<&Path>) -> Result<usize> {
+        let (config_path, config) = locate_config(self.select.config.as_deref(), near)?;
+        let root = root
+            .map(Path::to_path_buf)
+            .or_else(|| self.select.root.clone())
+            .or_else(|| config.root_path().map(|p| self.pretty(&p)));
+        let key = (config_path, root.clone());
+        if let Some(&g) = self.index.get(&key) {
+            return Ok(g);
+        }
+        let mut engine = Engine::with_root(config, root.as_deref())?;
+        for m in &self.select.macros {
+            engine.add_macro_file(m)?;
+        }
+        let profile = engine.profile(self.select.profile.as_deref())?;
+        self.groups.push(Group {
+            engine,
+            profile,
+            indices: Vec::new(),
+        });
+        self.index.insert(key, self.groups.len() - 1);
+        Ok(self.groups.len() - 1)
+    }
+}
+
+fn read_input(path: &Path) -> Result<Input> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Input {
+        path: Some(path.to_path_buf()),
+        text,
+    })
+}
+
+/// Read every input and build an engine per config and root. Everything is
+/// read before anything is written; a missing file is an error here.
+fn load(select: &Select) -> Result<Loaded> {
+    let cwd = std::env::current_dir().context("current directory")?;
+    let mut loader = Loader {
+        select,
+        cwd,
+        index: BTreeMap::new(),
+        groups: Vec::new(),
+    };
+    let mut inputs: Vec<Input> = Vec::new();
+    let mut group_of: Vec<usize> = Vec::new();
+    if select.project {
+        let roots: Vec<PathBuf> = if !select.files.is_empty() {
+            select.files.clone()
+        } else if let Some(r) = &select.root {
+            vec![r.clone()]
+        } else {
+            let (_, config) = locate_config(select.config.as_deref(), &loader.cwd)?;
+            match config.root_path() {
+                Some(p) => vec![loader.pretty(&p)],
+                None => bail!(
+                    "--project needs a root document: name it (`mathfmt --project main.tex`) or set `root` in mathfmt.toml"
+                ),
+            }
+        };
+        // A file two roots share is converted once, with the first.
+        let mut taken: BTreeSet<PathBuf> = BTreeSet::new();
+        for root in roots {
+            let near = loader.near(&root);
+            let g = loader.group(&near, Some(&root))?;
+            let files = loader.groups[g]
+                .engine
+                .project
+                .as_ref()
+                .map(|p| p.files.clone())
+                .unwrap_or_default();
+            for f in files {
+                let key = std::fs::canonicalize(&f).unwrap_or_else(|_| f.clone());
+                if !taken.insert(key) {
+                    continue;
+                }
+                loader.groups[g].indices.push(inputs.len());
+                group_of.push(g);
+                inputs.push(read_input(&f)?);
+            }
+        }
+    } else if select.files.is_empty() {
+        let mut text = String::new();
+        io::stdin()
+            .read_to_string(&mut text)
+            .context("reading stdin")?;
+        let near = loader.cwd.clone();
+        let g = loader.group(&near, None)?;
+        loader.groups[g].indices.push(0);
+        group_of.push(g);
+        inputs.push(Input { path: None, text });
+    } else {
+        for p in &select.files {
+            inputs.push(read_input(p)?);
+        }
+        for (i, p) in select.files.iter().enumerate() {
+            let near = loader.near(p);
+            let g = loader.group(&near, None)?;
+            loader.groups[g].indices.push(i);
+            group_of.push(g);
+        }
+    }
+    Ok(Loaded {
+        inputs,
+        groups: loader.groups,
+        group_of,
+    })
 }
 
 fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> {
@@ -199,77 +400,37 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
             .build_global()
             .ok();
     }
-    let cwd = std::env::current_dir().context("current directory")?;
-
-    // Read every input first; a missing file is a usage error before any write.
-    let inputs: Vec<Input> = if args.files.is_empty() {
-        let mut text = String::new();
-        io::stdin()
-            .read_to_string(&mut text)
-            .context("reading stdin")?;
-        vec![Input { path: None, text }]
-    } else {
-        args.files
-            .iter()
-            .map(|p| {
-                let text = std::fs::read_to_string(p)
-                    .with_context(|| format!("reading {}", p.display()))?;
-                Ok(Input {
-                    path: Some(p.clone()),
-                    text,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    // One engine per distinct config file (the nearest mathfmt.toml per file).
-    let mut configs: BTreeMap<Option<PathBuf>, Config> = BTreeMap::new();
-    let mut groups: BTreeMap<Option<PathBuf>, Vec<usize>> = BTreeMap::new();
-    for (i, input) in inputs.iter().enumerate() {
-        let near = input
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(|d| {
-                if d.as_os_str().is_empty() {
-                    cwd.clone()
-                } else {
-                    cwd.join(d)
-                }
-            })
-            .unwrap_or_else(|| cwd.clone());
-        let (key, config) = locate_config(args.config.as_deref(), &near)?;
-        configs.entry(key.clone()).or_insert(config);
-        groups.entry(key).or_default().push(i);
+    if args.write && args.select.files.is_empty() && !args.select.project {
+        bail!("--write needs FILEs or --project; stdin is never written back");
     }
+    let Loaded {
+        inputs,
+        groups,
+        group_of,
+    } = load(&args.select)?;
 
     let mut converted: Vec<Option<Converted>> = (0..inputs.len()).map(|_| None).collect();
     let mut emitted: Vec<Option<String>> = (0..inputs.len()).map(|_| None).collect();
-    // The engines and profiles stay alive for --verify, which needs them
-    // to build a snippet's preamble.
-    let mut engines: Vec<(Engine, Profile)> = Vec::new();
-    let mut engine_of: Vec<usize> = vec![0; inputs.len()];
-    for (key, indices) in groups {
-        let config = configs.remove(&key).expect("a config per group");
-        let engine = build_engine(config, &args.macros)?;
-        let profile: Profile = engine.profile(args.profile.as_deref())?;
-        for &i in &indices {
-            engine_of[i] = engines.len();
-        }
+    for group in &groups {
+        let Group {
+            engine,
+            profile,
+            indices,
+        } = group;
         let rename_map = match &rename {
             Some((from, to)) => {
                 let mut m = RenameMap::new();
                 m.insert(
-                    engine.parse_atom(from, &profile)?,
-                    engine.parse_atom(to, &profile)?,
+                    engine.parse_atom(from, profile)?,
+                    engine.parse_atom(to, profile)?,
                 );
                 m
             }
             None => RenameMap::new(),
         };
         if let Some(kind) = args.emit {
-            for &i in &indices {
-                emitted[i] = Some(emit(kind, &engine, &profile, &inputs[i])?);
+            for &i in indices {
+                emitted[i] = Some(emit(kind, engine, profile, &inputs[i])?);
             }
             continue;
         }
@@ -277,14 +438,13 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
             .par_iter()
             .map(|&i| {
                 let input = inputs[i].clone();
-                let outcome = engine.convert(&input.text, &profile, &rename_map);
+                let outcome = engine.convert(&input.text, profile, &rename_map);
                 (i, Converted { input, outcome })
             })
             .collect();
         for (i, c) in results {
             converted[i] = Some(c);
         }
-        engines.push((engine, profile));
     }
 
     let mut stdout = io::stdout().lock();
@@ -325,10 +485,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
             }
         } else if args.write {
             if outcome.changed {
-                let path = input
-                    .path
-                    .as_ref()
-                    .expect("clap requires files with --write");
+                let path = input.path.as_ref().expect("--write was given files");
                 write_atomically(path, &outcome.output)?;
             }
         } else if args.diff {
@@ -342,12 +499,24 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
     stdout.flush()?;
     let mut any_difference = false;
     if args.verify {
+        // What `mathfmt declarations` would print for each group, when the
+        // run asks for it in the preamble.
+        let declared: Vec<Option<String>> = groups
+            .iter()
+            .map(|g| {
+                args.declare.then(|| {
+                    let texts: Vec<&str> =
+                        g.indices.iter().map(|&i| inputs[i].text.as_str()).collect();
+                    g.engine.declarations(&texts, &g.profile, None).render()
+                })
+            })
+            .collect();
         let sources: Vec<verify::Source<'_>> = converted
             .iter()
             .enumerate()
             .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
             .map(|(i, c)| {
-                let (engine, profile) = &engines[engine_of[i]];
+                let group = &groups[group_of[i]];
                 Ok(verify::Source {
                     path: c
                         .input
@@ -356,17 +525,22 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
                         .ok_or_else(|| anyhow!("--verify needs FILEs, not stdin"))?,
                     original: &c.input.text,
                     converted: &c.outcome.output,
-                    engine,
-                    profile,
+                    engine: &group.engine,
+                    profile: &group.profile,
+                    program: args
+                        .engine
+                        .clone()
+                        .unwrap_or_else(|| group.engine.program()),
+                    project: args.select.project.then_some(group_of[i]),
+                    declare: declared[group_of[i]].as_deref(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         let options = verify::Options {
-            engine: args.engine.clone(),
             preamble: args.preamble.clone(),
             dpi: args.dpi,
             keep: args.keep.clone(),
-            macros: args.macros.clone(),
+            macros: args.select.macros.clone(),
         };
         for report in verify::run(&sources, &options)? {
             any_difference |= report.verdict.is_failure();
@@ -380,6 +554,83 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `mathfmt declarations`: the preamble lines each group's notation needs.
+fn declarations(select: Select, with: Option<With>) -> Result<ExitCode> {
+    let loaded = load(&select)?;
+    let mut out = io::stdout().lock();
+    for group in &loaded.groups {
+        let texts: Vec<&str> = group
+            .indices
+            .iter()
+            .map(|&i| loaded.inputs[i].text.as_str())
+            .collect();
+        let d = group
+            .engine
+            .declarations(&texts, &group.profile, with.map(Mechanism::from));
+        let what = match &group.engine.project {
+            Some(p) => p.root.display().to_string(),
+            None => match texts.len() {
+                1 => loaded.inputs[group.indices[0]].label(),
+                n => format!("{n} files"),
+            },
+        };
+        writeln!(
+            out,
+            "% mathfmt declarations: {what}, profile {}, {}",
+            group.profile.name,
+            d.mechanism.as_str()
+        )?;
+        let body = d.render();
+        if body.is_empty() {
+            writeln!(out, "% nothing to add")?;
+        } else {
+            out.write_all(body.as_bytes())?;
+        }
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `mathfmt project`: what project mode reads from a root, as TSV.
+fn project(root: Option<PathBuf>, config: Option<PathBuf>) -> Result<ExitCode> {
+    let select = Select {
+        files: Vec::new(),
+        profile: None,
+        config,
+        macros: Vec::new(),
+        project: true,
+        root,
+    };
+    let loaded = load(&select)?;
+    let mut out = io::stdout().lock();
+    for group in &loaded.groups {
+        let Some(p) = &group.engine.project else {
+            continue;
+        };
+        writeln!(out, "root\t{}", p.root.display())?;
+        writeln!(out, "engine\t{}", group.engine.program())?;
+        writeln!(out, "unicode-input\t{}", group.engine.mechanism().as_str())?;
+        if let Some(class) = &p.class {
+            writeln!(out, "class\t{class}")?;
+        }
+        for f in &p.files {
+            writeln!(out, "file\t{}", f.display())?;
+        }
+        for m in &p.missing {
+            writeln!(out, "missing\t{m}")?;
+        }
+        for d in &p.definitions {
+            writeln!(out, "definitions\t{}", d.display())?;
+        }
+        for package in &p.packages {
+            writeln!(out, "package\t{package}")?;
+        }
+        writeln!(out, "macros\t{}", group.engine.macros.len())?;
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn report(d: &Diagnostic, format: Format) -> Result<()> {

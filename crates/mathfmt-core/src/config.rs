@@ -29,6 +29,19 @@ pub enum Form {
     Latex,
 }
 
+/// The family of commands a profile spells the math alphabets with, before
+/// its own `style_commands`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StylePreset {
+    /// `\mathbf`, `\boldsymbol`, `\mathbb`, …: the kernel, amsmath, amssymb
+    /// and bm, as pdflatex typesets them.
+    Latex,
+    /// `\symbf`, `\symbfit`, `\symbb`, …: the unicode-math package, where
+    /// `\mathbf` is the text font's bold and `\boldsymbol` is not bold.
+    UnicodeMath,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
@@ -37,6 +50,9 @@ pub struct ProfileConfig {
     pub greek: Option<Form>,
     pub inline_macros: Option<bool>,
     pub script_reads_as: Option<String>,
+    /// Default: `unicode-math` when the project's preamble loads that
+    /// package, `latex` otherwise.
+    pub style_preset: Option<StylePreset>,
     #[serde(default)]
     pub style_commands: BTreeMap<String, String>,
     #[serde(default)]
@@ -62,6 +78,16 @@ pub struct Config {
     pub profile: String,
     #[serde(default)]
     pub macros: Vec<String>,
+    /// The project's root document, relative to this file: its preamble's
+    /// packages and definitions are in force for every file converted.
+    pub root: Option<String>,
+    /// The program `--verify` compiles with (default: what the root's
+    /// preamble says, else `pdflatex`).
+    pub engine: Option<String>,
+    /// How the document reads Unicode math, for `mathfmt declarations`
+    /// (default: `unicode-math` when the preamble loads it or the engine is
+    /// not pdflatex, else `unicode-math-input`).
+    pub unicode_input: Option<crate::declare::Mechanism>,
     #[serde(default)]
     pub math_environments: Vec<String>,
     #[serde(default)]
@@ -95,6 +121,9 @@ impl Default for Config {
             version: 1,
             profile: default_profile_name(),
             macros: Vec::new(),
+            root: None,
+            engine: None,
+            unicode_input: None,
             math_environments: Vec::new(),
             verbatim_environments: Vec::new(),
             text_commands: Vec::new(),
@@ -123,6 +152,46 @@ pub struct Profile {
     /// notation absent here is recognized but left in whatever form it has.
     pub notations: HashMap<String, String>,
 }
+
+impl Profile {
+    /// This profile with every class of atom printed as a command: what each
+    /// of its Unicode characters is spelled as in LaTeX.
+    pub fn latex_forms(&self) -> Profile {
+        Profile {
+            symbols: Form::Latex,
+            styled: Form::Latex,
+            greek: Form::Latex,
+            ..self.clone()
+        }
+    }
+}
+
+/// The unicode-math commands, as the package's default options read them:
+/// the shape of a bold or sans letter is the document's (`bold-style`,
+/// `sans-style`), so a literal 𝛔 and `\symbf{\sigma}` are the same house
+/// bold sigma and `bf` is `\symbf`, not `\symbfup`. `bfit`, `sfit` and
+/// `bfsfit` name their shape, which a literal character cannot under those
+/// options.
+const UNICODE_MATH_STYLE_COMMANDS: &[(&str, &str)] = &[
+    ("up", "\\symup"),
+    ("it", "\\symit"),
+    ("bf", "\\symbf"),
+    ("bf_greek", "\\symbf"),
+    ("bfit", "\\symbfit"),
+    ("bb", "\\symbb"),
+    ("bb_digit", "\\symbb"),
+    ("cal", "\\symcal"),
+    ("scr", "\\symscr"),
+    ("bfcal", "\\symbfcal"),
+    ("bfscr", "\\symbfscr"),
+    ("frak", "\\symfrak"),
+    ("bffrak", "\\symbffrak"),
+    ("sf", "\\symsf"),
+    ("sfit", "\\symsfit"),
+    ("bfsf", "\\symbfsf"),
+    ("bfsfit", "\\symbfsfit"),
+    ("tt", "\\symtt"),
+];
 
 const DEFAULT_STYLE_COMMANDS: &[(&str, &str)] = &[
     ("up", "\\mathrm"),
@@ -180,6 +249,11 @@ impl Config {
                 "version {} is not supported; this mathfmt reads version 1",
                 self.version
             )));
+        }
+        for (key, value) in [("root", &self.root), ("engine", &self.engine)] {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                return Err(ConfigError(format!("`{key}` is empty")));
+            }
         }
         for (name, p) in &self.profiles {
             for key in p.style_commands.keys() {
@@ -247,10 +321,24 @@ impl Config {
             .collect()
     }
 
+    /// The root document's path, when the config names one.
+    pub fn root_path(&self) -> Option<PathBuf> {
+        self.root.as_ref().map(|r| match &self.dir {
+            Some(d) => d.join(r),
+            None => PathBuf::from(r),
+        })
+    }
+
     /// Resolve a profile by name, with the built-in `unicode` and `ascii` as
     /// bases. A profile the file defines under another name starts from the
     /// `unicode` defaults.
     pub fn profile(&self, name: &str) -> Result<Profile, ConfigError> {
+        self.profile_with(name, StylePreset::Latex)
+    }
+
+    /// As [`Config::profile`], with the style preset a profile gets when it
+    /// does not choose one: the caller knows what the document loads.
+    pub fn profile_with(&self, name: &str, preset: StylePreset) -> Result<Profile, ConfigError> {
         let user = self.profiles.get(name);
         let builtin = match name {
             "unicode" => Some(Form::Unicode),
@@ -267,7 +355,11 @@ impl Config {
         }
         let base = builtin.unwrap_or(Form::Unicode);
         let user = user.cloned().unwrap_or_default();
-        let mut style_commands: HashMap<String, String> = DEFAULT_STYLE_COMMANDS
+        let preset = match user.style_preset.unwrap_or(preset) {
+            StylePreset::Latex => DEFAULT_STYLE_COMMANDS,
+            StylePreset::UnicodeMath => UNICODE_MATH_STYLE_COMMANDS,
+        };
+        let mut style_commands: HashMap<String, String> = preset
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
@@ -376,6 +468,49 @@ mod tests {
         ] {
             assert!(Config::parse(bad, None).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn style_presets_and_latex_forms() {
+        let c = Config::parse(
+            r#"
+            root = "main.tex"
+            engine = "lualatex"
+            [profiles.sym]
+            styled = "latex"
+            style_preset = "unicode-math"
+            [profiles.sym.style_commands]
+            bb = "\\mathbb"
+            [profiles.plain]
+            style_preset = "latex"
+            "#,
+            Some(Path::new("/paper")),
+        )
+        .unwrap();
+        assert_eq!(c.root_path(), Some(PathBuf::from("/paper/main.tex")));
+        assert_eq!(c.engine.as_deref(), Some("lualatex"));
+        let sym = c.profile("sym").unwrap();
+        assert_eq!(sym.style_commands["bf"], "\\symbf");
+        assert_eq!(sym.style_commands["bf_greek"], "\\symbf");
+        assert_eq!(sym.style_commands["sfit"], "\\symsfit");
+        assert_eq!(
+            sym.style_commands["bb"], "\\mathbb",
+            "its own override wins"
+        );
+        // A profile that says nothing takes the caller's preset; one that
+        // says `latex` keeps it whatever the document loads.
+        let ascii = c.profile_with("ascii", StylePreset::UnicodeMath).unwrap();
+        assert_eq!(ascii.style_commands["bfit"], "\\symbfit");
+        let plain = c.profile_with("plain", StylePreset::UnicodeMath).unwrap();
+        assert_eq!(plain.style_commands["bfit"], "\\boldsymbol");
+        assert_eq!(c.profile("ascii").unwrap().style_commands["bf"], "\\mathbf");
+        let forced = c.profile("unicode").unwrap().latex_forms();
+        assert_eq!(
+            (forced.symbols, forced.styled, forced.greek),
+            (Form::Latex, Form::Latex, Form::Latex)
+        );
+        assert!(Config::parse("root = \"\"", None).is_err());
+        assert!(Config::parse("[profiles.a]\nstyle_preset = \"sym\"", None).is_err());
     }
 
     #[test]

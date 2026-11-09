@@ -272,3 +272,159 @@ fn emit_keeps_argument_order_across_configs() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn write_tree(dir: &std::path::Path, files: &[(&str, &str)]) {
+    for (path, text) in files {
+        let p = dir.join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+}
+
+fn run_in(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+    let out = mathfmt()
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+#[test]
+fn project_mode_takes_files_and_definitions_from_the_root() {
+    let dir = temp_dir("project");
+    write_tree(
+        &dir,
+        &[
+            (
+                "main.tex",
+                "\\documentclass{article}\n\\usepackage{local}\n\\begin{document}\n$\\alpha$\n\\input{sections/a}\n\\end{document}\n",
+            ),
+            ("local.sty", "\\newcommand{\\R}{\\mathbb{R}}\n"),
+            ("sections/a.tex", "$x \\in \\R$\n"),
+            ("sections/unused.tex", "$\\beta$\n"),
+        ],
+    );
+    // The files are the root and what it inputs, in reading order.
+    let (code, out, err) = run_in(&dir, &["--project", "main.tex", "--check"]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(
+        out,
+        "would change: main.tex\nwould change: sections/a.tex\n"
+    );
+    // Alone, the section does not know the package's \R; under its root it does.
+    let (_, out, _) = run_in(&dir, &["sections/a.tex"]);
+    assert_eq!(out, "$x ∈ \\R$\n");
+    let (code, out, err) = run_in(&dir, &["--root", "main.tex", "sections/a.tex"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "$x ∈ ℝ$\n");
+    // `root` in the config does both: context for a lone file, and the
+    // files of --project with no FILE, from any directory below it.
+    fs::write(dir.join("mathfmt.toml"), "root = \"main.tex\"\n").unwrap();
+    let (_, out, _) = run_in(&dir.join("sections"), &["a.tex"]);
+    assert_eq!(out, "$x ∈ ℝ$\n");
+    let (code, _, err) = run_in(&dir, &["--project", "--write"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        fs::read_to_string(dir.join("sections/a.tex")).unwrap(),
+        "$x ∈ ℝ$\n"
+    );
+    assert!(fs::read_to_string(dir.join("main.tex"))
+        .unwrap()
+        .contains("$α$"));
+    assert_eq!(
+        fs::read_to_string(dir.join("local.sty")).unwrap(),
+        "\\newcommand{\\R}{\\mathbb{R}}\n",
+        "a package is read, never written"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("sections/unused.tex")).unwrap(),
+        "$\\beta$\n",
+        "a file the root does not input is not the project's"
+    );
+    let (code, out, _) = run_in(&dir, &["--project", "--check"]);
+    assert_eq!((code, out.as_str()), (0, ""));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn project_mode_needs_a_root_that_exists() {
+    let dir = temp_dir("project-root");
+    write_tree(&dir, &[("a.tex", "$\\alpha$\n")]);
+    let (code, out, err) = run_in(&dir, &["--project"]);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("--project needs a root document"), "{err}");
+    let (code, _, err) = run_in(&dir, &["--project", "absent.tex"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("absent.tex"), "{err}");
+    let (code, _, err) = run_in(&dir, &["--root", "absent.tex", "a.tex"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("absent.tex"), "{err}");
+    fs::write(dir.join("mathfmt.toml"), "root = \"absent.tex\"\n").unwrap();
+    let (code, _, err) = run_in(&dir, &["a.tex"]);
+    assert_eq!(code, 2, "a config whose root is missing is an error");
+    assert!(err.contains("absent.tex"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn declarations_and_project_say_what_the_root_has_and_needs() {
+    let dir = temp_dir("declarations");
+    write_tree(
+        &dir,
+        &[(
+            "main.tex",
+            "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n$\\mathbb{R} \\ni x \\leqslant \\mathbbm{1}$\n\\end{document}\n",
+        )],
+    );
+    let (code, out, err) = run_in(&dir, &["project", "main.tex"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        "root\tmain.tex\nengine\tpdflatex\nunicode-input\tunicode-math-input\nclass\tarticle\nfile\tmain.tex\npackage\tamsmath\nmacros\t0\n"
+    );
+    let (code, out, err) = run_in(
+        &dir,
+        &["declarations", "--project", "main.tex", "--with", "kernel"],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        "% mathfmt declarations: main.tex, profile unicode, kernel\n\
+         % packages the notation's commands need and the preamble does not load\n\
+         \\usepackage{amssymb}  % \\leqslant \\mathbb\n\
+         \\usepackage{bbm}  % \\mathbbm\n\
+         % Unicode math input: each character means what the profile spells it as\n\
+         \\DeclareUnicodeCharacter{211D}{\\ensuremath{\\mathbb{R}}}  % ℝ\n\
+         \\DeclareUnicodeCharacter{220B}{\\ensuremath{\\ni}}  % ∋\n\
+         \\DeclareUnicodeCharacter{2A7D}{\\ensuremath{\\leqslant}}  % ⩽\n\
+         \\DeclareUnicodeCharacter{1D7D9}{\\ensuremath{\\mathbbm{1}}}  % 𝟙\n"
+    );
+    // Without a root there is no preamble to subtract from, and the
+    // default mechanism under pdflatex is unicode-math-input, which knows
+    // the symbols itself.
+    let (code, out, _) = run_stdin(&["declarations"], "$α ∈ ℝ$ and $∆$\n");
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "% mathfmt declarations: <stdin>, profile unicode, unicode-math-input\n\
+         % packages the notation's commands need\n\
+         \\usepackage{amsfonts}  % \\mathbb\n\
+         \\usepackage{unicode-math-input}\n\
+         % styled letters, as the profile spells them (unicode-math-input follows pdflatex, which has no bold Greek under \\mathbf and no blackboard digits)\n\
+         \\umiDeclareMathChar{ℝ}{\\mathbb{R}}\n\
+         % ∆ (U+2206) is not declared: the tables have no LaTeX spelling for it; declare it by hand\n"
+    );
+    let (code, out, _) = run_stdin(&["declarations"], "no math here\n");
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "% mathfmt declarations: <stdin>, profile unicode, unicode-math-input\n% nothing to add\n"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

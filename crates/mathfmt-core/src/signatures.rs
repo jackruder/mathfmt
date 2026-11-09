@@ -100,6 +100,14 @@ impl Signatures {
         self.map.get(name)
     }
 
+    /// The math-alphabet commands (`mathbf`, `symbb`, `mathnormal`, …).
+    pub fn style_commands(&self) -> impl Iterator<Item = &str> {
+        self.map
+            .iter()
+            .filter(|(_, s)| s.style.is_some() || s.plain)
+            .map(|(n, _)| n.as_str())
+    }
+
     /// Names whose first argument is text; the scanner needs them.
     pub fn text_commands(&self) -> impl Iterator<Item = &str> {
         self.map

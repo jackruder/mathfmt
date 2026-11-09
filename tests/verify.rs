@@ -4,6 +4,10 @@
 //! says `differs` (a rename, or a repair that changes the typeset result on
 //! purpose) or `skip`, each followed by the reason.
 //!
+//! The project cases under `tests/projects/` are compiled the same way, as
+//! documents: `mathfmt --project --verify --declare`, with the engine the
+//! case's preamble asks for.
+//!
 //! Needs pdflatex and pdftoppm on PATH. Without them the test prints that it
 //! skipped and passes, unless `MATHFMT_VERIFY_REQUIRED` is set, as the
 //! flake's `verify` check sets it.
@@ -121,7 +125,7 @@ fn fixtures_render_the_same_after_conversion() {
             .map(|dir| {
                 scope.spawn(move || {
                     let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-                    (name, check_case(dir))
+                    (name, check_case(dir, command_for(dir)))
                 })
             })
             .collect();
@@ -145,13 +149,101 @@ fn fixtures_render_the_same_after_conversion() {
     eprintln!("verify: {verified} fixtures compared");
 }
 
-fn check_case(dir: &Path) -> Result<(), String> {
+fn projects_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects")
+}
+
+fn project_command(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mathfmt"));
+    cmd.current_dir(dir).args(args);
+    cmd
+}
+
+/// The engine `mathfmt project` reads from the case's root.
+fn project_engine(dir: &Path) -> String {
+    let out = project_command(dir, &["project"])
+        .output()
+        .expect("running mathfmt project");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("engine\t").map(str::to_string))
+        .unwrap_or_else(|| panic!("{}: mathfmt project names no engine", dir.display()))
+}
+
+#[test]
+fn projects_render_the_same_after_conversion() {
+    let required = std::env::var_os("MATHFMT_VERIFY_REQUIRED").is_some();
+    if !have("pdftoppm") {
+        if required {
+            panic!("MATHFMT_VERIFY_REQUIRED is set and `pdftoppm` is not on PATH");
+        }
+        eprintln!("verify: `pdftoppm` not on PATH; skipped");
+        return;
+    }
+    let mut dirs: Vec<PathBuf> = fs::read_dir(projects_dir())
+        .expect("tests/projects exists")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    let mut failures = Vec::new();
+    let mut verified = 0;
+    for dir in &dirs {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let engine = project_engine(dir);
+        if !have(&engine) {
+            if required {
+                panic!("MATHFMT_VERIFY_REQUIRED is set and `{engine}` is not on PATH");
+            }
+            eprintln!("verify: {name}: `{engine}` not on PATH; skipped");
+            continue;
+        }
+        let cmd = project_command(dir, &["--project", "--verify", "--declare", "-q"]);
+        match check_case(dir, cmd) {
+            Ok(()) => verified += 1,
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} projects failed to verify:\n\n{}",
+        failures.len(),
+        dirs.len(),
+        failures.join("\n\n")
+    );
+    eprintln!("verify: {verified} projects compared");
+}
+
+/// Without the declarations in its preamble the Unicode side of a pdflatex
+/// document does not compile, and the verdict says what to run.
+#[test]
+fn a_preamble_that_reads_no_unicode_is_broken_and_says_so() {
+    if !have("pdflatex") || !have("pdftoppm") {
+        if std::env::var_os("MATHFMT_VERIFY_REQUIRED").is_some() {
+            panic!("MATHFMT_VERIFY_REQUIRED is set and pdflatex or pdftoppm is not on PATH");
+        }
+        eprintln!("verify: pdflatex or pdftoppm not on PATH; skipped");
+        return;
+    }
+    let out = project_command(
+        &projects_dir().join("paper"),
+        &["--project", "--verify", "-q"],
+    )
+    .output()
+    .expect("running mathfmt");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.starts_with("broken: main.tex"), "{stdout}");
+    assert!(stdout.contains("mathfmt declarations"), "{stdout}");
+}
+
+fn check_case(dir: &Path, mut command: Command) -> Result<(), String> {
     let (expect, reason) = expectation(dir);
     if expect == Expect::Skip {
         eprintln!("verify: {} skipped: {reason}", dir.display());
         return Ok(());
     }
-    let out = command_for(dir)
+    let out = command
         .output()
         .map_err(|e| format!("running mathfmt: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);

@@ -16,17 +16,28 @@ work in the repository. It is loaded by every seat of the mathfmt rig
 - `crates/mathfmt-core/`: the library, one module per pipeline stage (scan,
   lex, parse, macros, notation, resolve, profile, print, config, diag).
   `notation.rs` holds the pattern matcher and the rewrite for notations with
-  holes (`[notations]` in the config). `src/main.rs`:
+  holes (`[notations]` in the config). `project.rs` reads a root document
+  (the files it inputs, the packages and local definition files of its
+  preamble, the engine) and `declare.rs` holds what `mathfmt declarations`
+  prints. `src/main.rs`:
   the CLI, thin; it is the root package so that pre-commit's
   `cargo install --path .` works.
-- `crates/mathfmt-core/data/`: the tables. `unicode-math.tsv` and
-  `alphabets.tsv` are generated; `latex.tsv` and `signatures.tsv` are written
-  by hand and are where a symbol, an alias or a command signature is added.
-- `tools/gen-table.py`: regenerates the two generated tables from
-  `kpsewhich unicode-math-table.tex`.
+- `crates/mathfmt-core/data/`: the tables. `unicode-math.tsv`,
+  `alphabets.tsv` and `packages.tsv` are generated; `latex.tsv` and
+  `signatures.tsv` are written by hand and are where a symbol, an alias or a
+  command signature is added.
+- `tools/gen-table.py`: regenerates the two Unicode tables from
+  `kpsewhich unicode-math-table.tex`. `tools/gen-packages.py`: regenerates
+  `packages.tsv` by asking pdflatex and lualatex which package defines each
+  command the tables emit; run it after adding a command to `latex.tsv` or a
+  style command to `signatures.tsv` (a unit test fails until it is).
 - `tests/fixtures/<case>/`: the golden cases, run by `tests/golden.rs` and
   compiled and compared by `tests/verify.rs`; `tests/cli.rs`: the binary's
-  interface. `tests/dev.sh`: the dev shell wrapper. `flake.nix`: dev shell,
+  interface. `tests/projects/<case>/`: small document trees with a
+  `mathfmt.toml` naming their `root`, converted and compared with
+  `expected/` by `tests/project.rs` (and `expected.declarations`), and
+  compiled by `tests/verify.rs` with `--project --verify --declare`.
+  `tests/dev.sh`: the dev shell wrapper. `flake.nix`: dev shell,
   package and checks. `src/verify.rs`: the `--verify` mode (compile both
   sides, rasterize, compare).
 - `.phalanix/`: the rig (lead, and task/review/question templates) and its

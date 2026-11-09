@@ -4,33 +4,40 @@
 //! [`resolve::resolve`] turns them into atoms, [`print::plan`] decides the
 //! edits a profile wants, and [`print::apply`] writes them into the original
 //! bytes. [`Engine`] holds the tables and the config and runs all four.
+//! With a root document ([`project::Project`]) it also knows the files, the
+//! definitions and the packages of the whole project, and
+//! [`Engine::declarations`] says what the preamble must hold.
 //!
 //! See `docs/superpowers/specs/2026-11-05-mathfmt-design.md`.
 
 pub mod atom;
 pub mod config;
+pub mod declare;
 pub mod diag;
 pub mod lex;
 pub mod macros;
 pub mod notation;
 pub mod parse;
 pub mod print;
+pub mod project;
 pub mod resolve;
 pub mod signatures;
 pub mod table;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use atom::{Atom, Style};
-pub use config::{Config, ConfigError, Form, Profile};
+pub use config::{Config, ConfigError, Form, Profile, StylePreset};
+pub use declare::{CharDecl, Declarations, Mechanism};
 pub use diag::{Diagnostic, Level, LineIndex};
 pub use lex::Span;
 pub use macros::{Macro, MacroTable};
 pub use notation::NotationOccurrence;
 pub use parse::{scan, Document, MathRegion, Node, RegionKind, ScanOptions};
 pub use print::{Edit, RenameMap};
+pub use project::Project;
 pub use resolve::{OccKind, Occurrence, Part};
 pub use signatures::Signatures;
 pub use table::Table;
@@ -100,12 +107,24 @@ pub struct Engine {
     pub signatures: Signatures,
     pub config: Config,
     pub scan_options: ScanOptions,
-    /// Definitions from the config's and the command line's macro files.
+    /// Definitions from the project's preamble and from the config's and
+    /// the command line's macro files.
     pub macros: MacroTable,
+    /// The root document and what it pulls in, when one is known.
+    pub project: Option<Project>,
 }
 
 impl Engine {
+    /// An engine for this config; its `root`, when it names one, is read.
     pub fn new(config: Config) -> Result<Engine, Error> {
+        Engine::with_root(config, None)
+    }
+
+    /// An engine whose project is `root` (as the caller names it), or the
+    /// config's `root` when `None`. The definitions of the root's preamble
+    /// and of the local packages it loads come first, so the config's macro
+    /// files, then the command line's, then each file's own, override them.
+    pub fn with_root(config: Config, root: Option<&Path>) -> Result<Engine, Error> {
         let table = Table::builtin();
         let mut signatures = Signatures::builtin();
         for c in &config.text_commands {
@@ -123,8 +142,20 @@ impl Engine {
             signatures,
             scan_options,
             macros: MacroTable::new(),
+            project: None,
             config,
         };
+        if let Some(root) = root
+            .map(Path::to_path_buf)
+            .or_else(|| engine.config.root_path())
+        {
+            let project = Project::read(&root).map_err(|e| Error::Io(root.clone(), e))?;
+            for f in &project.definitions {
+                engine.add_macro_file(f)?;
+            }
+            engine.add_macro_file(&root)?;
+            engine.project = Some(project);
+        }
         let files: Vec<PathBuf> = engine
             .config
             .macros
@@ -152,11 +183,156 @@ impl Engine {
         self.macros = doc.macros;
     }
 
-    /// The profile to use: `name`, else the config's default.
+    /// The profile to use: `name`, else the config's default. A profile
+    /// that does not choose a `style_preset` gets unicode-math's commands
+    /// when the project's preamble loads that package.
     pub fn profile(&self, name: Option<&str>) -> Result<Profile, Error> {
+        let preset = match &self.project {
+            Some(p) if p.loads("unicode-math") => StylePreset::UnicodeMath,
+            _ => StylePreset::Latex,
+        };
         Ok(self
             .config
-            .profile(name.unwrap_or(self.config.default_profile_name()))?)
+            .profile_with(name.unwrap_or(self.config.default_profile_name()), preset)?)
+    }
+
+    /// The program that compiles the document: the config's `engine`, else
+    /// what the project's root says, else `pdflatex`.
+    pub fn program(&self) -> String {
+        match (&self.config.engine, &self.project) {
+            (Some(e), _) => e.clone(),
+            (None, Some(p)) => p.engine().to_string(),
+            (None, None) => "pdflatex".to_string(),
+        }
+    }
+
+    /// How the document reads Unicode math: the config's `unicode_input`,
+    /// else `unicode-math` when the preamble loads it or the engine is not
+    /// pdflatex, else `unicode-math-input`.
+    pub fn mechanism(&self) -> Mechanism {
+        if let Some(m) = self.config.unicode_input {
+            return m;
+        }
+        let unicode_math = self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.loads("unicode-math"));
+        if unicode_math || !matches!(self.program().as_str(), "pdflatex" | "latex") {
+            Mechanism::UnicodeMath
+        } else {
+            Mechanism::UnicodeMathInput
+        }
+    }
+
+    /// Every atom these sources use, before or after conversion.
+    fn atoms_used(&self, sources: &[&str], profile: &Profile) -> BTreeSet<Atom> {
+        let mut atoms = BTreeSet::new();
+        for src in sources {
+            let first = self.convert(src, profile, &RenameMap::new());
+            let again = self.convert(&first.output, profile, &RenameMap::new());
+            for outcome in [&first, &again] {
+                for occ in &outcome.occurrences {
+                    atoms.extend(occ.atoms.iter().copied());
+                }
+            }
+        }
+        atoms
+    }
+
+    /// What the preamble must hold for these sources to compile in either
+    /// form: the packages the profile's commands come from, and a
+    /// declaration for each Unicode character the notation has, meaning
+    /// what the profile spells it as with commands. `mechanism` is how the
+    /// document reads Unicode ([`Engine::mechanism`] when `None`).
+    pub fn declarations(
+        &self,
+        sources: &[&str],
+        profile: &Profile,
+        mechanism: Option<Mechanism>,
+    ) -> Declarations {
+        let mechanism = mechanism.unwrap_or_else(|| self.mechanism());
+        let reference = profile.latex_forms();
+        let atoms = self.atoms_used(sources, profile);
+        let mut packages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut chars: BTreeSet<char> = BTreeSet::new();
+        for atom in &atoms {
+            chars.extend(self.table.char_of(atom));
+            if mechanism == Mechanism::UnicodeMath {
+                continue;
+            }
+            let Some(spelling) = print::spelling(atom, &reference, &self.table) else {
+                continue;
+            };
+            for word in declare::control_words(&spelling) {
+                if let Some(package) = self.table.package_of(&word) {
+                    packages
+                        .entry(package.to_string())
+                        .or_default()
+                        .insert(word);
+                }
+            }
+        }
+        let mut decls = Vec::new();
+        let mut undeclared = Vec::new();
+        for c in chars {
+            if mechanism == Mechanism::UnicodeMath {
+                break;
+            }
+            // The character as the resolver reads it, which is what a
+            // conversion would write for it.
+            let Ok(atom) = self.parse_atom(&c.to_string(), profile) else {
+                continue;
+            };
+            match print::spelling(&atom, &reference, &self.table) {
+                Some(s) if s.is_ascii() => {
+                    if mechanism == Mechanism::Kernel || matches!(atom, Atom::Styled { .. }) {
+                        decls.push(CharDecl {
+                            ch: c,
+                            atom,
+                            spelling: s,
+                        });
+                    }
+                }
+                Some(_) => undeclared.push((
+                    c,
+                    "the profile spells it with a character that is not ASCII".to_string(),
+                )),
+                None => undeclared.push((
+                    c,
+                    "the tables have no LaTeX spelling for it; declare it by hand".to_string(),
+                )),
+            }
+        }
+        match mechanism {
+            Mechanism::UnicodeMathInput if !atoms.is_empty() => {
+                packages
+                    .entry("unicode-math-input".to_string())
+                    .or_default();
+            }
+            Mechanism::UnicodeMath if !atoms.is_empty() => {
+                packages.entry("unicode-math".to_string()).or_default();
+            }
+            _ => {}
+        }
+        if let Some(project) = &self.project {
+            packages.retain(|package, _| !project.loads(package));
+        }
+        // A package another needed one loads is named by that one's line.
+        let names: Vec<String> = packages.keys().cloned().collect();
+        for name in &names {
+            for inner in project::implied(name) {
+                if let Some(commands) = packages.remove(*inner) {
+                    packages.entry(name.clone()).or_default().extend(commands);
+                }
+            }
+        }
+        Declarations {
+            mechanism,
+            preamble_known: self.project.is_some(),
+            packages,
+            chars: decls,
+            undeclared,
+        }
     }
 
     /// Convert one file's text.
@@ -385,6 +561,65 @@ mod tests {
         assert_eq!((o.notations.len(), o.notations[0].rewritten), (1, false));
         let inv = plain.notation_inventory(r"$D_{\mathrm{KL}}(p \| q) + \KL{a}{b}$", &p);
         assert_eq!((inv[0].count, inv[0].forms.len()), (2, 2));
+    }
+
+    /// Every math-alphabet command the signatures read has a row in the
+    /// generated `packages.tsv`, so `declarations` can name its package.
+    #[test]
+    fn every_style_command_has_a_package_row() {
+        let engine = Engine::new(Config::default()).unwrap();
+        let mut names: Vec<&str> = engine.signatures.style_commands().collect();
+        names.sort_unstable();
+        assert!(names.len() > 30, "{} style commands", names.len());
+        for name in names {
+            assert!(
+                engine.table.defined_by(name).is_some_and(|s| s != "-"),
+                "\\{name} has no row in packages.tsv, or none that defines it; run tools/gen-packages.py"
+            );
+        }
+    }
+
+    #[test]
+    fn declarations_follow_the_mechanism_and_the_profile() {
+        let engine = Engine::new(Config::default()).unwrap();
+        let unicode = engine.profile(None).unwrap();
+        let src = r"$\mathbf{\sigma} \in \mathbb{R}$ and $\mathscr{F} \neq ∆$";
+        let umi = engine.declarations(&[src], &unicode, None);
+        assert_eq!(umi.mechanism, Mechanism::UnicodeMathInput);
+        assert!(!umi.preamble_known);
+        let lines = |d: &Declarations| -> Vec<String> {
+            d.chars
+                .iter()
+                .map(|c| format!("{}={}", c.ch, c.spelling))
+                .collect()
+        };
+        // Styled letters only; the script letter reads back as cal.
+        assert_eq!(
+            lines(&umi),
+            [r"ℝ=\mathbb{R}", r"ℱ=\mathcal{F}", r"𝛔=\boldsymbol{\sigma}"]
+        );
+        assert_eq!(
+            umi.packages.keys().collect::<Vec<_>>(),
+            ["amsfonts", "amsmath", "mathrsfs", "unicode-math-input"]
+        );
+        assert_eq!(umi.undeclared.len(), 1, "∆ has no LaTeX spelling");
+        let kernel = engine.declarations(&[src], &unicode, Some(Mechanism::Kernel));
+        assert_eq!(
+            lines(&kernel),
+            [
+                r"ℝ=\mathbb{R}",
+                r"ℱ=\mathcal{F}",
+                r"∈=\in",
+                r"≠=\neq",
+                r"𝛔=\boldsymbol{\sigma}"
+            ]
+        );
+        assert!(!kernel.packages.contains_key("unicode-math-input"));
+        // unicode-math reads the characters itself.
+        let native = engine.declarations(&[src], &unicode, Some(Mechanism::UnicodeMath));
+        assert!(native.chars.is_empty());
+        assert_eq!(native.packages.keys().collect::<Vec<_>>(), ["unicode-math"]);
+        assert!(engine.declarations(&["no math"], &unicode, None).is_empty());
     }
 
     #[test]

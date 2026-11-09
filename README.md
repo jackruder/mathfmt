@@ -33,12 +33,20 @@ mathfmt [OPTIONS] [FILE...]
     -p, --profile NAME        profile from the config (default: config's `profile`)
     -c, --config PATH         config file (default: nearest mathfmt.toml)
         --macros FILE         an extra definition source (repeatable)
+        --project             FILEs are root documents: take every file each one
+                              inputs (no FILE: --root, else the config's `root`)
+        --root FILE           the root document of the FILEs: its preamble's
+                              packages and definitions apply to them
     -w, --write               rewrite FILEs in place (atomic: temp file + rename)
         --check               exit 1 if any file would change; print their names
         --diff                print a unified diff per changed file
         --emit KIND           regions | tokens | atoms | symbols, as JSON lines
         --verify              compile before and after, compare the rendered pages
-        --engine PROGRAM      the TeX engine --verify uses (default pdflatex)
+        --engine PROGRAM      the TeX engine --verify uses (default: the config's
+                              `engine`, else what the root's preamble says,
+                              else pdflatex)
+        --declare             under --verify, add the lines of `mathfmt
+                              declarations` to a document's preamble, both sides
         --preamble FILE       preamble for snippets under --verify
         --dpi N               resolution of the page comparison (default 100)
         --keep DIR            keep the --verify build trees
@@ -49,6 +57,8 @@ mathfmt [OPTIONS] [FILE...]
     -v, --verbose             also show informational diagnostics
 
 mathfmt rename --from SPELLING --to SPELLING [same options] [FILE...]
+mathfmt declarations [--project] [--root FILE] [--with MECHANISM] [FILE...]
+mathfmt project [ROOT]
 mathfmt table [--profile NAME]
 ```
 
@@ -59,12 +69,74 @@ mathfmt --check --diff main.tex sections/*.tex
 mathfmt --emit symbols main.tex | jq -r .atom | sort | uniq -c
 mathfmt rename --from 𝔉 --to ℱ --write sections/*.tex
 mathfmt --verify --macros ddssm.sty main.tex sections/*.tex
+mathfmt --project main.tex --write
+mathfmt --project main.tex --verify --declare
+mathfmt declarations --project main.tex >> preamble.tex
 ```
 
 Exit status: 0 clean; 1 `--check` found changes, `--strict` found warnings or
 `--verify` found a difference; 2 usage, config or I/O error. Silent on
 success. With no FILE it reads stdin, so guard a shell expansion that may come
 back empty; a pre-commit hook passes the files itself.
+
+### A whole paper at once
+
+A paper is a root file, the files it reads with `\input` and `\include`, and a
+preamble that loads packages, some of them local. Name the root and mathfmt
+reads that much itself, without running TeX:
+
+```sh
+mathfmt project main.tex            # what it found: files, packages, engine
+mathfmt --project main.tex --check  # every file the root inputs
+```
+
+or once, in `mathfmt.toml` beside the root:
+
+```toml
+root = "main.tex"
+```
+
+With a root, named either way, the definitions of its preamble and of the
+local packages and classes it loads (`\usepackage{ddssm}` with a `ddssm.sty`
+beside the root) are in force for every file, so a pre-commit hook that is
+handed `sections/method.tex` alone still knows the paper's `\R`. `--project`
+also takes the file list from the root: the root, then each file its body
+inputs, in reading order. A package is read and never rewritten. The reader
+does not evaluate conditionals, skips a file name built by a macro, and knows
+a distributed package by its name only.
+
+The preamble also says what the document is written for. One that loads
+`unicode-math` is compiled with lualatex by `--verify`, and a profile's
+commands for the math alphabets become unicode-math's (`\symbf`, `\symbb`,
+`\symcal`) instead of `\mathbf`, `\mathbb`, `\mathcal`, which that package
+typesets differently; `style_preset = "latex"` or `"unicode-math"` in a
+profile decides it by hand, `engine = "…"` in the config names the program.
+
+`mathfmt declarations` prints what the preamble must hold for the notation to
+compile in either form: the packages the profile's commands come from that
+the preamble does not load, and a meaning for the Unicode characters, each
+declared as exactly what the profile spells it with commands.
+
+```
+$ mathfmt declarations --project main.tex
+% mathfmt declarations: main.tex, profile unicode, unicode-math-input
+% packages the notation's commands need and the preamble does not load
+\usepackage{unicode-math-input}
+% styled letters, as the profile spells them (…)
+\umiDeclareMathChar{𝐱}{\mathbf{x}}
+\umiDeclareMathChar{𝛔}{\boldsymbol{\sigma}}
+\umiDeclareMathChar{𝟙}{\mathbbm{1}}
+…
+```
+
+How a document reads Unicode is a choice (`--with`, or `unicode_input` in the
+config):
+
+| | |
+|---|---|
+| `unicode-math-input` | pdflatex with that package. It knows every symbol, and reads a character after `\big` or as a script. Only styled letters are declared, where it follows pdflatex's limits. The default under pdflatex. |
+| `kernel` | pdflatex with `\DeclareUnicodeCharacter` and no package. Every character is declared, inside `\ensuremath`, so it also works in text. `\big⟨` does not compile. |
+| `unicode-math` | lualatex or xelatex with unicode-math. The characters are native; nothing is declared. |
 
 ### Proving a conversion is safe
 
@@ -77,39 +149,45 @@ compiled as it is, under its own preamble, with the converted copies of the
 other FILEs in place:
 
 ```
-$ mathfmt --verify --macros ddssm.sty main.tex sections/*.tex
+$ mathfmt --project main.tex --verify
 broken: main.tex: the converted source does not compile
   ! LaTeX Error: Unicode character 𝐱 (U+1D431)
                  not set up for use with LaTeX.
+  the preamble does not read this character: `mathfmt declarations` prints
+  the lines it needs, and --verify --declare compiles with them
 ```
 
-That is the honest answer for a pdflatex paper whose preamble does not load
-`unicode-math-input`: it is not safe to convert yet. With the package added,
-the same paper gives
+That is the honest answer for a pdflatex paper whose preamble does not read
+Unicode math: it is not safe to convert yet. `--declare` answers the next
+question without touching the paper: what would it render as with the lines
+of `mathfmt declarations` in its preamble? They are added before
+`\begin{document}` on both sides.
 
 ```
-differs: main.tex: 1 of 8 pages
-  page 3: 1717 pixels in the box x=137..281 y=753..849
-  text before: + 1[learnable µp ] Rµp .
-  text after:  + ⊮[learnable µp ] Rµp .
+$ mathfmt --project main.tex --verify --declare
+differs: main.tex: 1 of 14 pages
+  page 2: 3225 pixels in the box x=95..401 y=212..241
+  the extracted text is the same; the difference is in glyph shapes or positions
+  with 28 declaration lines added to the preamble on both sides
 ```
 
-because unicode-math-input reads `𝟙` as `\mathbb{1}`, which in amsfonts is the
-glyph ⊮, where the paper wrote `\mathbbm{1}`; one
-`\umiDeclareMathChar{𝟙}{\mathbbm{1}}` in the preamble closes it. With that
-line, and the paper's five `\KL{p}{q}` calls rewritten to their expanded form
-through a notation declaration, the verdict is
-`verified: main.tex (14 pages identical)`, in about two seconds.
+One page, and the reason is the paper's: it writes `\mathbf{\sigma_\theta}`,
+which pdflatex draws plain, and the Unicode `𝛔` is declared bold. With
+`bf_greek = "\\mathbf"` in the profile, which keeps pdflatex's reading, the
+verdict is `verified: main.tex (14 pages identical)`, in about eight seconds
+for the seventeen files.
 
 A FILE without `\documentclass` is a snippet and is wrapped in a preamble
 (`--preamble FILE`, or a built-in one that loads the usual packages and
 unicode-math-input and declares the styled letters the snippet uses to mean
-what the `ascii` profile spells them as). `--verify` needs the engine and
-`pdftoppm` on PATH; the test suite runs it over every fixture.
+what the profile spells them as). `--verify` needs the engine and
+`pdftoppm` on PATH; the test suite runs it over every fixture and over the
+small projects in `tests/projects/`, one of them under lualatex.
 
-A project's `mathfmt.toml` names the definition files whose macros the tool
-reads and the profiles it may emit; two profiles, `unicode` and `ascii`, exist
-with defaults even when the file does not mention them.
+A project's `mathfmt.toml` names its root, the definition files whose macros
+the tool reads beyond the root's, and the profiles it may emit; two profiles,
+`unicode` and `ascii`, exist with defaults even when the file does not mention
+them.
 
 ### Notations with arguments
 
@@ -186,7 +264,7 @@ repos:
 
 ## Known collapses
 
-Two places where the Unicode pivot loses a distinction, by design and
+Places where the Unicode pivot loses a distinction, by design and
 configurable:
 
 - **cal and scr.** `\mathcal{F}` and `\mathscr{F}` both print as the one Unicode
@@ -202,6 +280,17 @@ configurable:
   `ascii` profile spells it `\Im`; pdflatex draws `\mathfrak{I}` from eufm and
   `\Im` from cmsy, and they look different. Set `spellings."frak:I" =
   "\\mathfrak{I}"` (and `frak:R`) for a paper that means the letter.
+
+- **Shape under unicode-math.** With that package's default options the
+  shape of a bold or sans letter is the document's (`bold-style`,
+  `sans-style`), not the character's: a literal `𝛔`, a literal `𝝈` and
+  `\symbf{\sigma}` all draw the house bold sigma, and a literal `𝒙` draws
+  upright. The preset therefore spells `bf` as `\symbf` and `sf` as `\symsf`.
+  A letter whose shape contradicts the house style (`𝒙`, `𝘈`,
+  `\symbfup{\sigma}`, `\symbfit{x}`) changes when it crosses between a
+  character and a command. A document that sets `bold-style=literal` and
+  `sans-style=literal` wants `bf = "\\symbfup"`, `sf = "\\symsfup"` and
+  `bfsf = "\\symbfsfup"` in `style_commands`.
 
 `\mathbb{1}` is not a collapse but a repair: amsfonts has no blackboard digits
 and `\mathbb{1}` is the glyph ⊮, so the `bb_digit` key spells `𝟙` as

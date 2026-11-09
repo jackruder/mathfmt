@@ -123,10 +123,11 @@
             installPhase = "touch $out";
           });
 
-          # The compile-and-compare test (tests/verify.rs) over the fixtures,
-          # with a TeX Live that has what the built-in snippet preamble loads
-          # and poppler for pdftoppm. The ordinary `build` check skips this
-          # test for want of pdflatex; here it is required.
+          # The compile-and-compare test (tests/verify.rs) over the fixtures
+          # and the project cases, with a TeX Live that has what the built-in
+          # snippet preamble and the cases' own preambles load, and poppler
+          # for pdftoppm. The ordinary `build` check skips this test for want
+          # of pdflatex; here it is required.
           verify =
             let
               tex = pkgs.texliveSmall.withPackages (
@@ -140,6 +141,11 @@
                   listings
                   url
                   doublestroke
+                  # the unicode-math project case compiles with lualatex
+                  unicode-math
+                  fontspec
+                  lualatex-math
+                  lm-math
                 ]
               );
             in

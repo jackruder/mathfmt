@@ -18,8 +18,12 @@
 //! unicode-math-input follows pdflatex there. Symbols (`∈`, `≤`) are left to
 //! unicode-math-input's own table: that is the independent check of
 //! mathfmt's.
+//!
+//! A document is compiled under its author's preamble, unless the run asks
+//! for the lines `mathfmt declarations` prints (`--declare`): they are put
+//! before `\begin{document}` on both sides, which shows what the document
+//! would render as once its preamble holds them.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,12 +31,10 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
 
-use mathfmt_core::{Atom, Engine, Profile, RenameMap};
+use mathfmt_core::{Engine, Mechanism, Profile};
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// The program to compile with: `pdflatex`, `lualatex`, `xelatex`, …
-    pub engine: String,
     /// A preamble for snippets, replacing the built-in one.
     pub preamble: Option<PathBuf>,
     /// Rasterization resolution.
@@ -50,6 +52,13 @@ pub struct Source<'a> {
     pub converted: &'a str,
     pub engine: &'a Engine,
     pub profile: &'a Profile,
+    /// The program to compile with: `pdflatex`, `lualatex`, `xelatex`, …
+    pub program: String,
+    /// In project mode, the root this file was taken from: a document is
+    /// compiled with the files of its own project only.
+    pub project: Option<usize>,
+    /// Preamble lines to add before `\begin{document}` on both sides.
+    pub declare: Option<&'a str>,
 }
 
 /// (left, top, right, bottom), in pixels of the rasterized page.
@@ -90,10 +99,27 @@ impl Verdict {
 pub struct Report {
     pub root: PathBuf,
     pub verdict: Verdict,
+    /// Preamble lines added to both sides (`--declare`).
+    pub declared: usize,
 }
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.verdict_lines(f)?;
+        if self.declared > 0 && !matches!(self.verdict, Verdict::Unchanged) {
+            write!(
+                f,
+                "\n  with {} declaration line{} added to the preamble on both sides",
+                self.declared,
+                plural(self.declared)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Report {
+    fn verdict_lines(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let root = self.root.display();
         match &self.verdict {
             Verdict::Unchanged => write!(f, "unchanged: {root}"),
@@ -142,6 +168,12 @@ impl fmt::Display for Report {
                 for line in excerpt.lines() {
                     write!(f, "\n  {line}")?;
                 }
+                if excerpt.contains("not set up for use with LaTeX") && self.declared == 0 {
+                    write!(
+                        f,
+                        "\n  the preamble does not read this character: `mathfmt declarations` prints the lines it needs, and --verify --declare compiles with them"
+                    )?;
+                }
                 Ok(())
             }
         }
@@ -170,7 +202,12 @@ pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    check_tool(&opts.engine)?;
+    let mut programs: Vec<&str> = sources.iter().map(|s| s.program.as_str()).collect();
+    programs.sort_unstable();
+    programs.dedup();
+    for program in programs {
+        check_tool(program)?;
+    }
     check_tool("pdftoppm")?;
     let any_document = sources.iter().any(|s| is_document(s.original));
     let roots: Vec<usize> = (0..sources.len())
@@ -206,9 +243,10 @@ pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ));
-            verify_root(root, sources, &dir, opts).map(|verdict| Report {
+            verify_root(root, sources, &dir, opts).map(|(verdict, declared)| Report {
                 root: root.path.clone(),
                 verdict,
+                declared,
             })
         })
         .collect();
@@ -233,18 +271,58 @@ fn check_tool(name: &str) -> Result<()> {
     }
 }
 
+/// Put `block` before the first `\begin{document}` that is not in a
+/// comment; `None` when the text has none.
+fn inject(text: &str, block: &str) -> Option<String> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if let Some(at) = line.find("\\begin{document}") {
+            let before = &line.as_bytes()[..at];
+            let commented = before
+                .iter()
+                .enumerate()
+                .any(|(i, &b)| b == b'%' && (i == 0 || before[i - 1] != b'\\'));
+            if !commented {
+                let at = offset + at;
+                let mut out = String::with_capacity(text.len() + block.len() + 1);
+                out.push_str(&text[..at]);
+                out.push_str(block);
+                if !block.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&text[at..]);
+                return Some(out);
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The verdict for one root, and how many preamble lines were added.
 fn verify_root(
     root: &Source<'_>,
     all: &[Source<'_>],
     dir: &Path,
     opts: &Options,
-) -> Result<Verdict> {
-    if root.original == root.converted
-        && (!is_document(root.original) || all.iter().all(|s| s.original == s.converted))
-    {
-        return Ok(Verdict::Unchanged);
-    }
+) -> Result<(Verdict, usize)> {
     let document = is_document(root.original);
+    // A document is compiled with the files of its own project.
+    let all: Vec<&Source<'_>> = all.iter().filter(|s| s.project == root.project).collect();
+    if root.original == root.converted
+        && (!document || all.iter().all(|s| s.original == s.converted))
+    {
+        return Ok((Verdict::Unchanged, 0));
+    }
+    let declare = root
+        .declare
+        .filter(|block| document && !block.trim().is_empty());
+    let declared = declare.map_or(0, |block| {
+        block
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('%') && !l.trim().is_empty())
+            .count()
+    });
     let root_dir = root
         .path
         .parent()
@@ -271,12 +349,22 @@ fn verify_root(
         std::fs::create_dir_all(&src_dir)?;
         std::fs::create_dir_all(&out_dir)?;
         let job_name = if document {
-            for s in all {
+            for s in &all {
                 let text = if converted { s.converted } else { s.original };
+                let injected = match declare {
+                    Some(block) if std::ptr::eq(*s, root) => inject(text, block),
+                    _ => None,
+                };
+                let text = injected.as_deref().unwrap_or(text);
                 let rel = relative_to(&root_dir, &s.path)?;
                 let target = src_dir.join(&rel);
                 if let Some(p) = target.parent() {
                     std::fs::create_dir_all(p)?;
+                }
+                // `\include{sections/x}` writes `sections/x.aux` under the
+                // output directory, which TeX does not create.
+                if let Some(p) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(out_dir.join(p))?;
                 }
                 std::fs::write(&target, text)
                     .with_context(|| format!("writing {}", target.display()))?;
@@ -297,28 +385,31 @@ fn verify_root(
 
     let mut pdfs = Vec::new();
     for (i, (src_dir, out_dir, job)) in jobs.iter().enumerate() {
-        match compile(&opts.engine, src_dir, out_dir, job, &root_dir, root)? {
+        match compile(&root.program, src_dir, out_dir, job, &root_dir, root)? {
             Ok(pdf) => pdfs.push(pdf),
             Err(excerpt) => {
                 if i == 0 {
                     bail!(
                         "{}: the original does not compile with {}; nothing to compare against\n{}",
                         root.path.display(),
-                        opts.engine,
+                        root.program,
                         excerpt
                     );
                 }
-                return Ok(Verdict::Broken { excerpt });
+                return Ok((Verdict::Broken { excerpt }, declared));
             }
         }
     }
     let a = rasterize(&pdfs[0], &dir.join("a"), opts.dpi)?;
     let b = rasterize(&pdfs[1], &dir.join("b"), opts.dpi)?;
     if a.len() != b.len() {
-        return Ok(Verdict::PageCount {
-            original: a.len(),
-            converted: b.len(),
-        });
+        return Ok((
+            Verdict::PageCount {
+                original: a.len(),
+                converted: b.len(),
+            },
+            declared,
+        ));
     }
     let diffs: Vec<PageDiff> = a
         .iter()
@@ -333,14 +424,17 @@ fn verify_root(
         })
         .collect();
     if diffs.is_empty() {
-        return Ok(Verdict::Identical { pages: a.len() });
+        return Ok((Verdict::Identical { pages: a.len() }, declared));
     }
     let hint = text_hint(&pdfs[0], &pdfs[1]);
-    Ok(Verdict::Differs {
-        pages: a.len(),
-        diffs,
-        hint,
-    })
+    Ok((
+        Verdict::Differs {
+            pages: a.len(),
+            diffs,
+            hint,
+        },
+        declared,
+    ))
 }
 
 fn relative_to(root_dir: &Path, path: &Path) -> Result<PathBuf> {
@@ -415,7 +509,7 @@ fn wrap_snippet(root: &Source<'_>, text: &str, opts: &Options) -> Result<String>
                 out.push('\n');
             }
         }
-        None => out.push_str(builtin_preamble(&opts.engine)?),
+        None => out.push_str(builtin_preamble(&root.program)?),
     }
     // Lines holding a preamble-only command move up whole; both sides are
     // treated alike, so the move cannot hide a difference.
@@ -452,7 +546,7 @@ fn wrap_snippet(root: &Source<'_>, text: &str, opts: &Options) -> Result<String>
             out.push_str(&format!("\\input{{{}}}\n", abs.display()));
         }
     }
-    if opts.preamble.is_none() && opts.engine == "pdflatex" {
+    if opts.preamble.is_none() && root.program == "pdflatex" {
         out.push_str(&styled_declarations(root));
     }
     out.push_str("\\begin{document}\n");
@@ -505,37 +599,22 @@ fn builtin_preamble(engine: &str) -> Result<&'static str> {
 }
 
 /// `\umiDeclareMathChar` lines for every styled letter or digit the snippet
-/// uses, before or after conversion, spelled as the `ascii` profile would.
+/// uses, before or after conversion, spelled as the profile would with commands.
 fn styled_declarations(root: &Source<'_>) -> String {
-    let engine = root.engine;
-    let Ok(ascii) = engine.config.profile("ascii") else {
-        return String::new();
-    };
-    let mut atoms: BTreeSet<Atom> = BTreeSet::new();
-    for text in [root.original, root.converted] {
-        let outcome = engine.convert(text, root.profile, &RenameMap::new());
-        for occ in &outcome.occurrences {
-            atoms.extend(occ.atoms.iter().copied());
-        }
-    }
+    let declarations = root.engine.declarations(
+        &[root.original, root.converted],
+        root.profile,
+        Some(Mechanism::UnicodeMathInput),
+    );
     let mut out = String::new();
-    for atom in atoms {
-        let Atom::Styled { .. } = atom else { continue };
-        let (Some(c), Some(spelling)) = (
-            engine.table.char_of(&atom),
-            mathfmt_core::print::spelling(&atom, &ascii, &engine.table),
-        ) else {
-            continue;
-        };
-        if !spelling.starts_with('\\') {
-            continue;
-        }
+    for d in &declarations.chars {
         if out.is_empty() {
-            out.push_str(
-                "% styled letters, as mathfmt's ascii profile spells them (see mathfmt table)\n",
-            );
+            out.push_str("% styled letters, as the profile spells them with commands (see mathfmt declarations)\n");
         }
-        out.push_str(&format!("\\umiDeclareMathChar{{{c}}}{{{spelling}}}\n"));
+        out.push_str(&format!(
+            "\\umiDeclareMathChar{{{}}}{{{}}}\n",
+            d.ch, d.spelling
+        ));
     }
     out
 }
@@ -681,6 +760,17 @@ fn text_hint(a: &Path, b: &Path) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declarations_go_before_the_first_live_begin_document() {
+        let text = "\\documentclass{article}\n% \\begin{document}\n\\title{50\\% off}\\begin{document}\nx\n\\begin{document}\n";
+        let out = inject(text, "\\usepackage{bbm}").unwrap();
+        assert_eq!(
+            out,
+            "\\documentclass{article}\n% \\begin{document}\n\\title{50\\% off}\\usepackage{bbm}\n\\begin{document}\nx\n\\begin{document}\n"
+        );
+        assert!(inject("no document here\n% \\begin{document}\n", "x").is_none());
+    }
 
     #[test]
     fn documents_are_recognized_outside_comments() {
