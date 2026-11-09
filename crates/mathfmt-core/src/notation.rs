@@ -7,10 +7,16 @@
 //! Matching is tree matching modulo atoms: a leaf matches a leaf that stands
 //! for the same atom (`\|` and `‖`), else the same text; a group matches a
 //! group with matching children, and a group of one matches that one; a
-//! hole binds the shortest run of nodes that lets the rest of the pattern
-//! match, or, when it fills a group, that group's contents. Forms are tried
-//! most specific first (most tokens), so `(#1 \,\|\, #2)` wins over
-//! `(#1 \| #2)` where both would match.
+//! hole binds the shortest run of nodes, balanced in its delimiters, that
+//! lets the rest of the pattern match, or, when it fills a group, that
+//! group's contents. Forms are tried most specific first (most tokens)
+//! across all notations, so `(#1 \,\|\, #2)` wins over `(#1 \| #2)` where
+//! both would match.
+//!
+//! The matcher prefers no match to a doubtful one: a stretch of source that
+//! holds a comment or an unclosed group is never a match, a group standing
+//! alone in the document (`{\mid}`) is not its content, and a form must
+//! begin and end with something literal.
 //!
 //! Rewriting fills the profile's form with the holes' converted text and
 //! runs the result through the profile once more, so the form's own
@@ -19,7 +25,7 @@
 
 use std::cmp::Reverse;
 
-use crate::atom::Atom;
+use crate::atom::{is_greek, Atom, Style};
 use crate::config::Profile;
 use crate::lex::{lex_all, Span, TokKind};
 use crate::macros::MacroTable;
@@ -87,12 +93,32 @@ pub fn parse_notations(
 }
 
 /// Check a pattern for the config: holes numbered `#1`…`#n` without gaps,
-/// never two holes with nothing but space between them. Returns `n`.
+/// never two holes with nothing but space between them, braces balanced,
+/// no comment, and something literal at both ends: a hole at the edge of a
+/// form has no boundary, and a form of holes alone would match everything.
+/// Returns `n`.
 pub fn check_pattern(pattern: &str) -> Result<usize, String> {
     let toks = lex_all(pattern);
+    if toks
+        .iter()
+        .any(|t| t.kind == TokKind::Trivia && t.text(pattern).contains('%'))
+    {
+        return Err("a form cannot hold a comment".to_string());
+    }
     let mut seen = [false; 10];
     let mut last_was_hole = false;
-    for t in toks.iter().filter(|t| t.kind != TokKind::Trivia) {
+    let mut depth = 0usize;
+    let real: Vec<_> = toks.iter().filter(|t| t.kind != TokKind::Trivia).collect();
+    for t in &real {
+        match t.kind {
+            TokKind::Open => depth += 1,
+            TokKind::Close => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "a `}` closes nothing".to_string())?;
+            }
+            _ => {}
+        }
         if t.kind == TokKind::Param {
             let n: usize = t.text(pattern)[1..]
                 .parse()
@@ -109,6 +135,25 @@ pub fn check_pattern(pattern: &str) -> Result<usize, String> {
             last_was_hole = true;
         } else {
             last_was_hole = false;
+        }
+    }
+    if depth != 0 {
+        return Err("a `{` is never closed".to_string());
+    }
+    if !real
+        .iter()
+        .any(|t| !matches!(t.kind, TokKind::Param | TokKind::Open | TokKind::Close))
+    {
+        return Err(
+            "a form needs something literal beside its holes, or it would match everything"
+                .to_string(),
+        );
+    }
+    for (edge, t) in [("begins", real.first()), ("ends", real.last())] {
+        if t.is_some_and(|t| t.kind == TokKind::Param) {
+            return Err(format!(
+                "the form {edge} with a bare hole, which has no boundary there; enclose it (`{{#1}}`) or put a literal beside it"
+            ));
         }
     }
     let count = seen.iter().rposition(|&s| s).unwrap_or(0);
@@ -140,6 +185,8 @@ pub struct Match<'n> {
     pub holes: Vec<Binding<'n>>,
     /// Raw nodes consumed from the position the match was tried at.
     pub consumed: usize,
+    /// Whether the profile rewrites this match; the resolver decides.
+    pub rewritten: bool,
 }
 
 /// An owned record of a match, for the outcome and `--emit`.
@@ -154,8 +201,53 @@ pub struct NotationOccurrence {
 }
 
 pub struct Matcher<'a> {
-    pub table: &'a Table,
-    pub doc_src: &'a str,
+    table: &'a Table,
+    sigs: &'a Signatures,
+    doc_src: &'a str,
+    /// Every (notation, form), most specific form first, then by notation
+    /// and form name.
+    order: Vec<(usize, usize)>,
+}
+
+/// +1 for a node that opens a delimited stretch, -1 for one that closes
+/// one, 0 otherwise. Kinds are not told apart, so `[0, 1)` is balanced.
+fn delimiter(node: &Node, src: &str) -> i32 {
+    match node {
+        Node::Leaf(t) => match (t.kind, t.text(src)) {
+            (TokKind::Char, "(" | "[" | "⟨" | "⌊" | "⌈") => 1,
+            (TokKind::Char, ")" | "]" | "⟩" | "⌋" | "⌉") => -1,
+            (TokKind::ControlSymbol, "\\{") => 1,
+            (TokKind::ControlSymbol, "\\}") => -1,
+            (TokKind::ControlWord, "\\langle" | "\\lfloor" | "\\lceil") => 1,
+            (TokKind::ControlWord, "\\rangle" | "\\rfloor" | "\\rceil") => -1,
+            _ => 0,
+        },
+        Node::Command(c) => match c.name.name(src) {
+            "left" => 1,
+            "right" => -1,
+            "langle" | "lfloor" | "lceil" if c.args.is_empty() => 1,
+            "rangle" | "rfloor" | "rceil" if c.args.is_empty() => -1,
+            _ => 0,
+        },
+        Node::Group(_) => 0,
+    }
+}
+
+fn is_script(node: &Node) -> bool {
+    matches!(node, Node::Leaf(t) if matches!(t.kind, TokKind::Sup | TokKind::Sub))
+}
+
+/// Every group and text argument under these nodes is closed.
+fn all_closed(nodes: &[Node]) -> bool {
+    nodes.iter().all(|n| match n {
+        Node::Leaf(_) => true,
+        Node::Group(g) => g.close.is_some() && all_closed(&g.children),
+        Node::Command(c) => c.args.iter().all(|a| match a {
+            Arg::Math(n) | Arg::Delim(n) => all_closed(std::slice::from_ref(n)),
+            Arg::Text(t) => t.close.is_some(),
+            Arg::Optional(_) => true,
+        }),
+    })
 }
 
 fn is_trivia(n: &Node) -> bool {
@@ -209,8 +301,36 @@ fn take_nodes(doc: &[Node], count: usize) -> Option<usize> {
 }
 
 impl<'a> Matcher<'a> {
-    /// Try every form of every notation at `nodes[start]`. Notations are
-    /// tried in order and forms most specific first; the first match wins.
+    pub fn new(
+        table: &'a Table,
+        sigs: &'a Signatures,
+        doc_src: &'a str,
+        notations: &[Notation],
+    ) -> Matcher<'a> {
+        let mut order: Vec<(usize, usize)> = notations
+            .iter()
+            .enumerate()
+            .flat_map(|(ni, n)| (0..n.forms.len()).map(move |fi| (ni, fi)))
+            .collect();
+        order.sort_by(|&(an, af), &(bn, bf)| {
+            let (a, b) = (&notations[an].forms[af], &notations[bn].forms[bf]);
+            b.weight
+                .cmp(&a.weight)
+                .then_with(|| notations[an].name.cmp(&notations[bn].name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Matcher {
+            table,
+            sigs,
+            doc_src,
+            order,
+        }
+    }
+
+    /// Try every form at `nodes[start]`, the most specific form of any
+    /// notation first; the first match wins. A stretch that holds a comment
+    /// or an unclosed group is never a match: a rewrite could not carry the
+    /// one and would run past the other.
     pub fn match_at<'n>(
         &self,
         notations: &[Notation],
@@ -221,42 +341,49 @@ impl<'a> Matcher<'a> {
         if rest.iter().all(is_trivia) {
             return None;
         }
-        for (ni, notation) in notations.iter().enumerate() {
-            for (fi, form) in notation.forms.iter().enumerate() {
-                let pat = non_trivia(&form.nodes);
-                if pat.is_empty() {
-                    continue;
-                }
-                let mut binds: Vec<Option<Binding<'n>>> =
-                    (0..notation.holes).map(|_| None).collect();
-                if let Some(used) =
-                    self.match_seq(&pat, &form.pattern, rest, &mut binds, true, false, true)
-                {
-                    if used == 0 || binds.iter().any(Option::is_none) {
-                        continue;
-                    }
-                    return Some(Match {
-                        notation: ni,
-                        form: fi,
-                        span: span_of_run(&rest[..used]),
-                        holes: binds.into_iter().map(Option::unwrap).collect(),
-                        consumed: used,
-                    });
-                }
+        for &(ni, fi) in &self.order {
+            let (notation, form) = (&notations[ni], &notations[ni].forms[fi]);
+            let pat = non_trivia(&form.nodes);
+            if pat.is_empty() {
+                continue;
             }
+            let mut binds: Vec<Option<Binding<'n>>> = (0..notation.holes).map(|_| None).collect();
+            let Some(used) =
+                self.match_seq(&pat, &form.pattern, rest, &mut binds, true, false, false)
+            else {
+                continue;
+            };
+            if used == 0 || binds.iter().any(Option::is_none) {
+                continue;
+            }
+            let span = span_of_run(&rest[..used]);
+            let commented = lex_all(span.text(self.doc_src)).iter().any(|t| {
+                t.kind == TokKind::Trivia && t.text(span.text(self.doc_src)).contains('%')
+            });
+            if commented || !all_closed(&rest[..used]) {
+                continue;
+            }
+            return Some(Match {
+                notation: ni,
+                form: fi,
+                span,
+                holes: binds.into_iter().map(Option::unwrap).collect(),
+                consumed: used,
+                rewritten: false,
+            });
         }
         None
     }
 
     /// Match `pat` (trivia-free) against a prefix of the raw `doc`. With
     /// `exact`, all of `doc` must be used (trailing trivia aside). `top` is
-    /// true at the region level, where a trailing hole takes one node, not
-    /// the rest of the line. `first` marks the match's first node: there a
-    /// pattern node that is not a group never matches a doc group by looking
-    /// inside it, since the match would then cover braces the rewrite does
-    /// not reproduce (`\underbrace{\KL{p}{q}}`); the walker descends into the
-    /// group and matches there instead. Returns how many raw doc nodes were
-    /// used.
+    /// true at the region level. `after_script` says the node before `doc`
+    /// was a `^` or `_`, so a group at its head is an operand, which is the
+    /// same thing as its content; a group standing alone is not (`{\mid}`
+    /// is an ordinary symbol where `\mid` is a relation), and at a match's
+    /// first node matching through it would also cover braces the rewrite
+    /// does not reproduce (`\underbrace{\KL{p}{q}}`). Returns how many raw
+    /// doc nodes were used.
     #[allow(clippy::too_many_arguments)]
     fn match_seq<'n>(
         &self,
@@ -266,9 +393,8 @@ impl<'a> Matcher<'a> {
         binds: &mut Vec<Option<Binding<'n>>>,
         top: bool,
         exact: bool,
-        first: bool,
+        after_script: bool,
     ) -> Option<usize> {
-        let first_node_at_top = first && top;
         let lead = doc.iter().take_while(|n| is_trivia(n)).count();
         let Some((&first, rest_pat)) = pat.split_first() else {
             return if exact {
@@ -284,8 +410,9 @@ impl<'a> Matcher<'a> {
         if let Some(h) = hole_index(first, pat_src) {
             let h = h.checked_sub(1)?;
             if rest_pat.is_empty() {
-                // A trailing hole: the rest of a group's contents, or one
-                // node at the top level.
+                // A trailing hole: the rest of a group's contents. (At the
+                // top level the config refuses one; one node, if it comes
+                // to that.)
                 let take = if exact || !top {
                     d.len()
                 } else {
@@ -293,14 +420,33 @@ impl<'a> Matcher<'a> {
                 };
                 return self.bind(h, &d[..take], binds).then_some(lead + take);
             }
-            let available = d.iter().filter(|n| !is_trivia(n)).count();
-            for k in 1..=available {
-                let end = take_nodes(d, k)?;
+            // The shortest run that is balanced in its delimiters and lets
+            // the rest match. A run that closes a delimiter it did not open
+            // has left the stretch the hole began in, and ends the search.
+            let mut depth = 0i32;
+            for (i, node) in d.iter().enumerate() {
+                if is_trivia(node) {
+                    continue;
+                }
+                depth += delimiter(node, self.doc_src);
+                if depth < 0 {
+                    return None;
+                }
+                if depth != 0 {
+                    continue;
+                }
+                let end = i + 1;
                 let saved: Vec<bool> = binds.iter().map(Option::is_some).collect();
                 if self.bind(h, &d[..end], binds) {
-                    if let Some(used) =
-                        self.match_seq(rest_pat, pat_src, &d[end..], binds, top, exact, false)
-                    {
+                    if let Some(used) = self.match_seq(
+                        rest_pat,
+                        pat_src,
+                        &d[end..],
+                        binds,
+                        top,
+                        exact,
+                        is_script(node),
+                    ) {
                         return Some(lead + end + used);
                     }
                 }
@@ -312,20 +458,30 @@ impl<'a> Matcher<'a> {
             }
             return None;
         }
-        if first_node_at_top && matches!(d[0], Node::Group(_)) && !matches!(first, Node::Group(_)) {
+        if !self.match_node(first, pat_src, &d[0], binds, after_script) {
             return None;
         }
-        if !self.match_node(first, pat_src, &d[0], binds) {
-            return None;
-        }
-        let used = self.match_seq(rest_pat, pat_src, &d[1..], binds, top, exact, false)?;
+        let used = self.match_seq(
+            rest_pat,
+            pat_src,
+            &d[1..],
+            binds,
+            top,
+            exact,
+            is_script(&d[0]),
+        )?;
         Some(lead + 1 + used)
     }
 
     /// Bind hole `h` to a raw run; a repeated hole must bind the same text.
     fn bind<'n>(&self, h: usize, run: &'n [Node], binds: &mut [Option<Binding<'n>>]) -> bool {
         let span = span_of_run(run);
-        match &binds[h] {
+        // The config gives every form of a notation the same holes; a form
+        // with one more than the others binds nothing.
+        let Some(slot) = binds.get(h) else {
+            return false;
+        };
+        match slot {
             Some(existing) => {
                 existing.span.text(self.doc_src).trim() == span.text(self.doc_src).trim()
             }
@@ -345,7 +501,10 @@ impl<'a> Matcher<'a> {
         let lead = text.len() - text.trim_start().len();
         let trail = text.len() - text.trim_end().len();
         let span = Span::new(start + lead, (end - trail).max(start + lead));
-        match &binds[h] {
+        let Some(slot) = binds.get(h) else {
+            return false;
+        };
+        match slot {
             Some(existing) => existing.span.text(self.doc_src).trim() == span.text(self.doc_src),
             None => {
                 binds[h] = Some(Binding {
@@ -357,6 +516,9 @@ impl<'a> Matcher<'a> {
         }
     }
 
+    /// The atom a node stands for by itself: a symbol character, a symbol
+    /// command, or a style command over one base (`\mathbb{E}`), which is
+    /// what the character `𝔼` is.
     fn atom_of(&self, node: &Node, src: &str) -> Option<Atom> {
         match node {
             Node::Leaf(t) => match t.kind {
@@ -373,6 +535,41 @@ impl<'a> Matcher<'a> {
                 _ => None,
             },
             Node::Command(c) if c.args.is_empty() => self.table.atom_of_name(c.name.name(src)),
+            Node::Command(c) => {
+                let style = self.sigs.get(c.name.name(src))?.style?;
+                let [Arg::Math(arg)] = c.args.as_slice() else {
+                    return None;
+                };
+                let inner: &Node = match arg {
+                    Node::Group(g) => match non_trivia(&g.children).as_slice() {
+                        [one] => one,
+                        _ => return None,
+                    },
+                    other => other,
+                };
+                let base = match inner {
+                    Node::Leaf(t) if t.kind == TokKind::Char => {
+                        let mut it = t.text(src).chars();
+                        match (it.next(), it.next()) {
+                            (Some(c), None) if c.is_ascii_alphanumeric() => c,
+                            (Some(c), None) => match self.table.atom_of_char(c) {
+                                Some(Atom::Named(n)) if is_greek(n) => n,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        }
+                    }
+                    other => match self.atom_of(other, src) {
+                        Some(Atom::Named(n)) if is_greek(n) => n,
+                        _ => return None,
+                    },
+                };
+                // An upright ASCII letter is an operator word, not a symbol.
+                if style == Style::Up && base.is_ascii_alphanumeric() {
+                    return None;
+                }
+                Some(Atom::styled(base, style))
+            }
             _ => None,
         }
     }
@@ -383,6 +580,7 @@ impl<'a> Matcher<'a> {
         pat_src: &str,
         d: &'n Node,
         binds: &mut Vec<Option<Binding<'n>>>,
+        operand: bool,
     ) -> bool {
         // `{#1}` takes a group's contents, or a single node.
         if let Some(h) = hole_only_group(p, pat_src) {
@@ -406,10 +604,12 @@ impl<'a> Matcher<'a> {
             }
             // A group of one is that one.
             (Node::Group(pg), other) => {
-                matches!(non_trivia(&pg.children).as_slice(), [one] if self.match_node(one, pat_src, other, binds))
+                matches!(non_trivia(&pg.children).as_slice(), [one] if self.match_node(one, pat_src, other, binds, operand))
             }
-            (other, Node::Group(dg)) => {
-                matches!(non_trivia(&dg.children).as_slice(), [one] if self.match_node(other, pat_src, one, binds))
+            // The document's group of one is that one only where the braces
+            // mean nothing: as a script operand or a command's argument.
+            (other, Node::Group(dg)) if operand => {
+                matches!(non_trivia(&dg.children).as_slice(), [one] if self.match_node(other, pat_src, one, binds, true))
             }
             (Node::Leaf(pt), Node::Leaf(dt)) => {
                 pt.kind == dt.kind && pt.text(pat_src) == dt.text(self.doc_src)
@@ -423,7 +623,7 @@ impl<'a> Matcher<'a> {
                 }
                 pc.args.iter().zip(&dc.args).all(|(pa, da)| match (pa, da) {
                     (Arg::Math(pn), Arg::Math(dn)) | (Arg::Delim(pn), Arg::Delim(dn)) => {
-                        self.match_node(pn, pat_src, dn, binds)
+                        self.match_node(pn, pat_src, dn, binds, true)
                     }
                     (Arg::Optional(_), Arg::Optional(_)) | (Arg::Text(_), Arg::Text(_)) => {
                         pa.span().text(pat_src).trim() == da.span().text(self.doc_src).trim()
@@ -448,22 +648,43 @@ pub fn rewrite(
     profile: &Profile,
     convert: &dyn Fn(&str) -> String,
 ) -> Vec<Edit> {
-    let mut order: Vec<&Match<'_>> = matches
-        .iter()
-        .filter(|m| profile.notations.contains_key(&notations[m.notation].name))
-        .collect();
+    let mut order: Vec<&Match<'_>> = matches.iter().filter(|m| m.rewritten).collect();
     order.sort_by_key(|m| (m.span.len(), m.span.start));
     for m in order {
-        let pattern = &profile.notations[&notations[m.notation].name];
+        let Some(pattern) = profile.notations.get(&notations[m.notation].name) else {
+            continue;
+        };
+        // An edit that straddles the match's edge cannot be kept beside the
+        // match's own edit; the notation is left as written.
+        if edits.iter().any(|e| {
+            e.span.start < m.span.end
+                && e.span.end > m.span.start
+                && !(e.span.start >= m.span.start && e.span.end <= m.span.end)
+        }) {
+            continue;
+        }
+        let all = lex_all(pattern);
         let mut out = String::new();
-        for t in lex_all(pattern) {
+        for (i, t) in all.iter().enumerate() {
             let text: String = if t.kind == TokKind::Param {
                 let n: usize = t.text(pattern)[1..].parse().unwrap_or(0);
                 let Some(hole) = n.checked_sub(1).and_then(|i| m.holes.get(i)) else {
                     continue;
                 };
-                let text = apply_within(src, hole.span, &edits);
-                if crate::print::is_script_operand(&out) && !is_one_token(&text) {
+                let mut text = apply_within(src, hole.span, &edits);
+                // Where the form supplies the grouping (`{#1}`, or a script
+                // whose operand is braced below), the binding's own braces
+                // would be a second pair: `_{x}` into `\E{#1}` is `\E{x}`.
+                let script = crate::print::is_script_operand(&out);
+                let real = |j: Option<usize>| j.and_then(|j| all.get(j)).map(|t| t.kind);
+                let enclosed = real(prev_real(&all, i)) == Some(TokKind::Open)
+                    && real(next_real(&all, i)) == Some(TokKind::Close);
+                if script || enclosed {
+                    if let Some(inner) = crate::print::one_group_contents(&text) {
+                        text = inner.trim().to_string();
+                    }
+                }
+                if script && !is_one_token(&text) {
                     format!("{{{text}}}")
                 } else {
                     text
@@ -502,6 +723,16 @@ pub fn rewrite(
     }
     edits.sort_by_key(|e| e.span.start);
     edits
+}
+
+/// The index of the nearest token before `i` that is not trivia.
+fn prev_real(toks: &[crate::lex::Token], i: usize) -> Option<usize> {
+    (0..i).rev().find(|&j| toks[j].kind != TokKind::Trivia)
+}
+
+/// The index of the nearest token after `i` that is not trivia.
+fn next_real(toks: &[crate::lex::Token], i: usize) -> Option<usize> {
+    (i + 1..toks.len()).find(|&j| toks[j].kind != TokKind::Trivia)
 }
 
 /// `src[span]` with the edits inside it applied.
@@ -557,10 +788,7 @@ mod tests {
         let sigs = Signatures::builtin();
         let doc = scan(src, &sigs, &ScanOptions::default(), &MacroTable::new());
         let nots = notations(decls, &doc.macros);
-        let m = Matcher {
-            table: &table,
-            doc_src: src,
-        };
+        let m = Matcher::new(&table, &sigs, src, &nots);
         let region = doc.regions.first()?;
         let found = m.match_at(&nots, &region.nodes, 0)?;
         Some((
@@ -646,11 +874,122 @@ mod tests {
     }
 
     #[test]
+    fn a_hole_is_balanced_in_its_delimiters() {
+        assert_eq!(
+            first_match(r"$D_{\mathrm{KL}}(p \| q(x)) + 1$", KL).map(|m| (m.1, m.2)),
+            Some((
+                r"D_{\mathrm{KL}}(p \| q(x))".into(),
+                vec!["p".into(), "q(x)".into()]
+            )),
+            "the hole does not stop at the inner parenthesis"
+        );
+        assert_eq!(
+            first_match(r"$D_{\mathrm{KL}}(p_\theta(z | x) \| p(z))$", KL).map(|m| m.2),
+            Some(vec![r"p_\theta(z | x)".into(), "p(z)".into()])
+        );
+        assert_eq!(
+            first_match(r"$D_{\mathrm{KL}}(\left(a\right) \| [0, 1))$", KL).map(|m| m.2),
+            Some(vec![r"\left(a\right)".into(), "[0, 1)".into()]),
+            "kinds of delimiter are not told apart, so a half-open interval is balanced"
+        );
+        assert_eq!(
+            first_match(r"$D_{\mathrm{KL}}(p) + (q \| r)$", KL),
+            None,
+            "a hole does not leave the parentheses it began in"
+        );
+    }
+
+    #[test]
+    fn a_comment_or_an_unclosed_group_is_never_a_match() {
+        assert_eq!(first_match("$\\KL{p}{q$", KL), None);
+        assert_eq!(first_match("$\\KL{p % first\n}{q}$", KL), None);
+        assert_eq!(first_match("$D_{\\mathrm{KL}}(p % c\n\\| q)$", KL), None);
+        assert!(first_match("$\\KL{p\n}{q}$", KL).is_some());
+    }
+
+    const COND: &[(&str, &[(&str, &str)])] = &[(
+        "cond",
+        &[
+            ("bar", r"P(#1 \mid #2)"),
+            ("sub", r"P_\mathrm{c}(#1 \mid #2)"),
+        ],
+    )];
+
+    #[test]
+    fn a_standing_group_is_not_its_content_and_an_operand_is() {
+        assert!(first_match(r"$P(A \mid B)$", COND).is_some());
+        assert_eq!(
+            first_match(r"$P(A {\mid} B)$", COND),
+            None,
+            "{{\\mid}} is an ordinary symbol, \\mid a relation"
+        );
+        assert_eq!(
+            first_match(r"$P_{\mathrm{c}}(A \mid B)$", COND).map(|m| m.0),
+            Some("sub".into()),
+            "a braced script operand is its content"
+        );
+    }
+
+    #[test]
+    fn a_styled_literal_is_its_character() {
+        let e: &[(&str, &[(&str, &str)])] = &[
+            ("E", &[("sub", r"\mathbb{E}_#1[#2]")]),
+            ("N", &[("expanded", r"\mathcal{N}(#1, #2)")]),
+        ];
+        assert_eq!(
+            first_match("$𝔼_{x ∼ p}[f]$", e).map(|m| (m.0, m.2)),
+            Some(("sub".into(), vec!["{x ∼ p}".into(), "f".into()]))
+        );
+        assert_eq!(
+            first_match("$𝒩(μ, Σ)$", e).map(|m| m.2),
+            Some(vec!["μ".into(), "Σ".into()])
+        );
+        assert_eq!(
+            first_match(r"$\mathbbm{E}_x[f]$", e).map(|m| m.0),
+            Some("sub".into()),
+            "another command for the same alphabet is the same atom"
+        );
+        assert_eq!(first_match(r"$\mathbf{E}_x[f]$", e), None);
+    }
+
+    #[test]
+    fn the_most_specific_form_wins_across_notations() {
+        let two: &[(&str, &[(&str, &str)])] = &[
+            ("aa", &[("one", r"\foo(#1)")]),
+            ("zz", &[("two", r"\foo(#1 \| #2)")]),
+        ];
+        assert_eq!(
+            first_match(r"$\foo(a \| b)$", two).map(|m| m.0),
+            Some("two".into()),
+            "the longer form of the later notation is tried first"
+        );
+        assert_eq!(
+            first_match(r"$\foo(a)$", two).map(|m| m.0),
+            Some("one".into())
+        );
+    }
+
+    #[test]
     fn patterns_are_checked() {
         assert_eq!(check_pattern(r"\KL{#1}{#2}"), Ok(2));
         assert_eq!(check_pattern(r"x"), Ok(0));
+        assert_eq!(check_pattern(r"x_{#1}"), Ok(1));
         assert!(check_pattern(r"\KL{#1}{#3}").is_err());
         assert!(check_pattern(r"#1 #2").is_err());
         assert!(check_pattern(r"(#1, #2)").is_ok());
+        for bad in [
+            "",
+            "   ",
+            "#1",
+            "{#1}",
+            r"{#1",
+            r"a}",
+            "#1 % c",
+            r"\foo{#1} % c",
+            r"#1 \cdot #2",
+            r"\foo #1",
+        ] {
+            assert!(check_pattern(bad).is_err(), "`{bad}` should be refused");
+        }
     }
 }

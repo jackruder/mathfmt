@@ -1,0 +1,5 @@
+[notations.KL]
+macro    = "\\KL{#1}{#2}"
+expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+[profiles.unicode.notations]
+KL = "expanded"

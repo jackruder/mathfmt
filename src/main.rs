@@ -23,10 +23,10 @@ mod verify;
 #[derive(Parser)]
 #[command(name = "mathfmt", version, about = "Rewrite math notation in LaTeX source to one profile", long_about = None)]
 #[command(
-    after_help = "Exit status: 0 clean; 1 --check found changes, --strict found warnings or --verify found a difference; 2 usage, config or I/O error.\n\
+    after_help = "Exit status: 0 clean; 1 --check found changes, --strict found warnings or --verify found a difference; 2 usage, config or I/O error, or an original that --verify could not compile.\n\
 With no FILE, reads stdin and writes stdout. With FILEs and none of --write, --check, --diff, --emit or --verify, writes each converted file to stdout in turn.\n\
 --project takes the files from a root document: every file it reads with \\input or \\include. The root is the FILE, else --root, else `root` in mathfmt.toml. With a root, named either way, the definitions of its preamble and of the local packages it loads are in force for every file.\n\
---verify compiles the original and the converted source with the same engine and compares the rendered pages pixel for pixel. A FILE holding \\documentclass is a document, compiled as it is with the converted copies of the other FILEs in place; without one, each FILE is a snippet wrapped in a preamble. Needs the engine and pdftoppm on PATH."
+--verify compiles the original and the converted source with the same engine and compares the rendered pages pixel for pixel. A FILE holding \\documentclass is a document, compiled as it is with the converted copies of the other FILEs in place; a FILE no document reads is a snippet, wrapped in a preamble and verified on its own. Needs the engine and pdftoppm on PATH."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -129,8 +129,15 @@ struct RunArgs {
     /// Preamble for snippets under --verify (default: built in, per engine)
     #[arg(long, value_name = "FILE", requires = "verify")]
     preamble: Option<PathBuf>,
-    /// Resolution of the page comparison under --verify
-    #[arg(long, value_name = "N", default_value_t = 100, requires = "verify")]
+    /// Resolution of the page comparison under --verify, 50 to 2400; a
+    /// coarse raster hides small differences
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 100,
+        requires = "verify",
+        value_parser = clap::value_parser!(u32).range(50..=2400)
+    )]
     dpi: u32,
     /// Keep the --verify build directories here
     #[arg(long, value_name = "DIR", requires = "verify")]
@@ -498,6 +505,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
     }
     stdout.flush()?;
     let mut any_difference = false;
+    let mut any_error = false;
     if args.verify {
         // What `mathfmt declarations` would print for each group, when the
         // run asks for it in the preamble.
@@ -544,9 +552,15 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
         };
         for report in verify::run(&sources, &options)? {
             any_difference |= report.verdict.is_failure();
+            any_error |= report.verdict.is_error();
             writeln!(stdout, "{report}")?;
         }
         stdout.flush()?;
+    }
+    // Every verdict is printed first; one that could not be reached (an
+    // original that does not compile) is an error, not a difference.
+    if any_error {
+        return Ok(ExitCode::from(2));
     }
     let failed = (args.check && any_changed) || (args.strict && any_warning) || any_difference;
     Ok(if failed {

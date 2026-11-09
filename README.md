@@ -13,9 +13,10 @@ format-on-save, a one-off switch of a whole repository to ASCII for a venue
 that cannot take Unicode) or about what compiles the result.
 
 Status: version zero. Atomic symbols (named symbols, Greek letters, styled
-letters and digits, zero-argument macros that stand for one of them) convert in
-both directions; parameterized notations are designed and not yet built. See
-`docs/superpowers/specs/2026-11-05-mathfmt-design.md`.
+letters and digits, zero-argument macros that stand for one of them) and
+notations with arguments (`\KL{p}{q}` and `D_{\mathrm{KL}}(p \| q)`) convert
+in both directions; a conversion can be compiled before and after and the
+pages compared. See `docs/superpowers/specs/2026-11-05-mathfmt-design.md`.
 
 ## Install
 
@@ -75,8 +76,9 @@ mathfmt declarations --project main.tex >> preamble.tex
 ```
 
 Exit status: 0 clean; 1 `--check` found changes, `--strict` found warnings or
-`--verify` found a difference; 2 usage, config or I/O error. Silent on
-success. With no FILE it reads stdin, so guard a shell expansion that may come
+`--verify` found a difference; 2 usage, config or I/O error, or an original
+that `--verify` could not compile (every other verdict is still printed).
+Silent on success. With no FILE it reads stdin, so guard a shell expansion that may come
 back empty; a pre-commit hook passes the files itself.
 
 ### A whole paper at once
@@ -208,13 +210,30 @@ KL = "expanded"         # \KL{p}{q}  →  D_{\mathrm{KL}}(p ‖ q)
 ```
 
 Matching is on the math tree modulo symbols, so `\|`, `\Vert` and `‖` are one
-thing, `D_\mathrm{KL}` is `D_{\mathrm{KL}}`, and the holes bind whatever sits
-between the literals: `D_{\mathrm{KL}}(\mathcal{N}(\mu,\Sigma) ‖ q_\phi)`
-becomes `\KL{\mathcal{N}(\mu, \Sigma)}{q_\phi}`, with the holes converted and
-nested notations handled inside them. The form a profile writes goes through
-the profile's symbol spellings too, so one form serves both. A profile that
-names no form leaves the notation as written; `--emit symbols` still counts
-it, form by form.
+thing, `\mathbb{E}` in a form is the character `𝔼` in the source,
+`D_\mathrm{KL}` is `D_{\mathrm{KL}}`, and a hole binds the shortest stretch
+between the literals that is balanced in its delimiters:
+`D_{\mathrm{KL}}(q_\phi(z \mid x) ‖ p(z))` becomes
+`\KL{q_\phi(z \mid x)}{p(z)}`, with the holes converted and nested notations
+handled inside them. The form a profile writes goes through the profile's
+symbol spellings too, so one form serves both; a macro in it (`\R^{#1}`) is
+written as it stands. Among forms that match, the one with the most tokens
+wins, whichever notation it belongs to. A profile that names no form leaves
+the notation as written; `--emit symbols` still counts it, form by form.
+
+The matcher prefers no match to a doubtful one, and a notation it does not
+match is left exactly as written:
+
+- A form must begin and end with something literal. `#1 \cdot #2` is refused
+  by the config: a hole at the edge has no boundary.
+- A stretch that holds a `%` comment or a brace that is never closed is not a
+  match. A rewrite would swallow what follows the one and run to the end of
+  the file through the other.
+- A group standing alone is not its content: `P(A {\mid} B)` is not
+  `P(#1 \mid #2)`, because the braces make the bar an ordinary symbol. A
+  braced script operand or command argument is its content.
+- A notation that is itself a script operand (`e^\KL{p}{q}`) is kept: what
+  the script takes there is the macro's business.
 
 ## What it does to a real paper
 

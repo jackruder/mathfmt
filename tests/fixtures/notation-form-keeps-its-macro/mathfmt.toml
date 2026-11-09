@@ -1,0 +1,5 @@
+[notations.Rn]
+short = "\\R^{#1}"
+long  = "\\mathbb{R}^{#1}"
+[profiles.unicode.notations]
+Rn = "short"

@@ -1,0 +1,1 @@
+skip: the input is for lualatex; under pdflatex \hat takes one byte of the character 𝐱, with any way of reading Unicode

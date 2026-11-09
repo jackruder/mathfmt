@@ -1,0 +1,1 @@
+skip: a brace is never closed, so nothing compiles; the case pins that nothing is deleted

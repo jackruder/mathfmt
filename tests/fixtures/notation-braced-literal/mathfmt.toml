@@ -1,0 +1,5 @@
+[notations.cond]
+macro = "\\cond{#1}{#2}"
+bar   = "P(#1 \\mid #2)"
+[profiles.ascii.notations]
+cond = "macro"

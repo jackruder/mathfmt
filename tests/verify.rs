@@ -283,3 +283,179 @@ fn check_case(dir: &Path, mut command: Command) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// True (and says so) when the tools are missing and the test may skip.
+fn skip_without_tex(what: &str) -> bool {
+    if have("pdflatex") && have("pdftoppm") {
+        return false;
+    }
+    if std::env::var_os("MATHFMT_VERIFY_REQUIRED").is_some() {
+        panic!("MATHFMT_VERIFY_REQUIRED is set and pdflatex or pdftoppm is not on PATH");
+    }
+    eprintln!("verify: {what}: pdflatex or pdftoppm not on PATH; skipped");
+    true
+}
+
+fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("mathfmt-verify-test-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    for (path, text) in files {
+        let p = dir.join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+    dir
+}
+
+fn verify_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = project_command(dir, args)
+        .arg("-q")
+        .output()
+        .expect("running mathfmt");
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+fn document(body: &str) -> String {
+    format!("\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
+}
+
+/// Two documents side by side, a part of one, a snippet nothing reads and a
+/// snippet that cannot compile: each root gets its verdict, the part is
+/// verified with its document, and the failure takes nobody else's verdict.
+#[test]
+fn every_root_gets_a_verdict() {
+    if skip_without_tex("several roots") {
+        return;
+    }
+    let dir = tree(
+        "roots",
+        &[
+            ("p1/main.tex", &document("$a \\le b$ \\input{sections/a}")),
+            ("p1/sections/a.tex", "$c \\ne d$\n"),
+            ("p2/main.tex", &document("$e \\ge f$")),
+            ("other.tex", "$g \\to h$\n"),
+            ("bad.tex", "$\\le \\undefinedmacro$\n"),
+        ],
+    );
+    let (code, out) = verify_in(
+        &dir,
+        &[
+            "--profile",
+            "ascii",
+            "--verify",
+            "p1/main.tex",
+            "p1/sections/a.tex",
+            "p2/main.tex",
+            "other.tex",
+            "bad.tex",
+        ],
+    );
+    for line in [
+        "verified: p1/main.tex (1 page identical)",
+        "verified: p2/main.tex (1 page identical)",
+        "verified: other.tex (1 page identical)",
+        "error: bad.tex: the original does not compile with pdflatex",
+        "no document among the FILEs reads bad.tex",
+    ] {
+        assert!(out.contains(line), "missing `{line}` in:\n{out}");
+    }
+    assert!(
+        !out.contains("sections/a.tex:"),
+        "a part has no verdict of its own:\n{out}"
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "an original that does not compile is an error:\n{out}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--keep DIR` may be relative and may be used again: the second run does
+/// not read the first one's pages. A directory mathfmt did not make is
+/// refused, not cleared.
+#[test]
+fn a_kept_build_is_relative_reusable_and_never_someone_elses() {
+    if skip_without_tex("--keep") {
+        return;
+    }
+    let dir = tree(
+        "keep",
+        &[(
+            "doc.tex",
+            &document("One $a \\le b$.\n\\newpage\nTwo $c \\ne d$."),
+        )],
+    );
+    let args = [
+        "--profile",
+        "ascii",
+        "--verify",
+        "--keep",
+        "kept",
+        "doc.tex",
+    ];
+    let (code, out) = verify_in(&dir, &args);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("verified: doc.tex (2 pages identical)"),
+        "{out}"
+    );
+    assert!(dir.join("kept/0-doc/a/out/doc.pdf").is_file());
+    fs::write(dir.join("doc.tex"), document("One $a \\le b$.")).unwrap();
+    let (code, out) = verify_in(&dir, &args);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("verified: doc.tex (1 page identical)"),
+        "the first run's second page is not this run's:\n{out}"
+    );
+    fs::create_dir_all(dir.join("mine/0-doc")).unwrap();
+    fs::write(dir.join("mine/0-doc/notes.txt"), "precious").unwrap();
+    let (code, out) = verify_in(
+        &dir,
+        &[
+            "--profile",
+            "ascii",
+            "--verify",
+            "--keep",
+            "mine",
+            "doc.tex",
+        ],
+    );
+    assert_eq!(code, Some(2), "{out}");
+    assert!(out.contains("was not made by mathfmt"), "{out}");
+    assert_eq!(
+        fs::read_to_string(dir.join("mine/0-doc/notes.txt")).unwrap(),
+        "precious"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A snippet's `--macros` package is found wherever it lives.
+#[test]
+fn a_snippet_finds_its_macro_package_in_another_directory() {
+    if skip_without_tex("--macros") {
+        return;
+    }
+    let dir = tree(
+        "macros",
+        &[
+            ("shared/mydefs.sty", "\\newcommand{\\R}{\\mathbb{R}}\n"),
+            ("work/s.tex", "$x \\in \\R$\n"),
+        ],
+    );
+    let (code, out) = verify_in(
+        &dir.join("work"),
+        &["--verify", "--macros", "../shared/mydefs.sty", "s.tex"],
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("verified: s.tex (1 page identical)"), "{out}");
+    let _ = fs::remove_dir_all(&dir);
+}

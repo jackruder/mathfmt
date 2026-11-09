@@ -43,12 +43,41 @@ pub struct Occurrence {
     /// atoms in order with nothing between), else the atoms interleaved with
     /// the scripts and braces of a style group such as `\mathbf{x_1}`.
     pub parts: Vec<Part>,
+    /// The occurrence is the whole of an unbraced argument (`\hat\alpha`,
+    /// the `\beta` of `\frac\alpha\beta`): its replacement must still be
+    /// one argument, and it never merges with a neighbour.
+    pub bare_arg: bool,
 }
 
 impl Occurrence {
     pub fn is_flat(&self) -> bool {
         self.parts.is_empty()
     }
+}
+
+/// Flag the occurrence that is exactly the unbraced argument `arg`.
+fn mark_bare_arg(arg: &Node, pushed: &mut [Occurrence]) {
+    if matches!(arg, Node::Group(_)) {
+        return;
+    }
+    let span = arg.span();
+    for o in pushed {
+        if o.span == span {
+            o.bare_arg = true;
+        }
+    }
+}
+
+/// Where `inner` sits in `outer`, when it is a sub-slice of it.
+fn index_range(outer: &[Node], inner: &[Node]) -> Option<std::ops::Range<usize>> {
+    let size = std::mem::size_of::<Node>();
+    let base = outer.as_ptr() as usize;
+    let at = inner.as_ptr() as usize;
+    if inner.is_empty() || size == 0 || at < base {
+        return None;
+    }
+    let start = (at - base) / size;
+    (start + inner.len() <= outer.len()).then(|| start..start + inner.len())
 }
 
 fn push_text(parts: &mut Vec<Part>, text: &str) {
@@ -78,10 +107,7 @@ pub fn resolve<'d>(
         depth: 0,
         diags: Vec::new(),
         notations,
-        matcher: Matcher {
-            table,
-            doc_src: src,
-        },
+        matcher: Matcher::new(table, sigs, src, notations),
         matches: Vec::new(),
     };
     let mut out = Vec::new();
@@ -113,17 +139,32 @@ impl<'a, 'n> Resolver<'a, 'n> {
     fn walk(&mut self, nodes: &'n [Node], out: &mut Vec<Occurrence>) -> bool {
         let mut complete = true;
         let mut i = 0;
+        // Inside a notation kept as written, only what its holes hold can
+        // start another match: its literals are spoken for. The end of the
+        // kept match and the index ranges of its holes at this level.
+        let mut kept: Option<(usize, Vec<std::ops::Range<usize>>)> = None;
         while i < nodes.len() {
+            if kept.as_ref().is_some_and(|(end, _)| i >= *end) {
+                kept = None;
+            }
             // Try the notations at a real node only: trying at the space
             // before one would find the same match twice.
             let trivia = matches!(&nodes[i], Node::Leaf(t) if t.kind == TokKind::Trivia);
-            if !self.notations.is_empty() && !trivia {
-                if let Some(m) = self.matcher.match_at(self.notations, nodes, i) {
-                    let rewritten = self
+            let open = match &kept {
+                Some((_, holes)) => holes.iter().any(|r| r.contains(&i)),
+                None => true,
+            };
+            if !self.notations.is_empty() && !trivia && open {
+                if let Some(mut m) = self.matcher.match_at(self.notations, nodes, i) {
+                    // A notation that is a script operand (`e^\KL{p}{q}`) is
+                    // kept as written: what the script takes depends on the
+                    // macro's definition, which a rewrite would not carry.
+                    m.rewritten = self
                         .profile
                         .notations
-                        .contains_key(&self.notations[m.notation].name);
-                    if rewritten {
+                        .contains_key(&self.notations[m.notation].name)
+                        && !crate::print::is_script_operand(&self.src[..m.span.start]);
+                    if m.rewritten {
                         // The form supplies the literal parts; only the holes
                         // are ours to convert, and nested notations in them.
                         for hole in &m.holes {
@@ -136,6 +177,14 @@ impl<'a, 'n> Resolver<'a, 'n> {
                     }
                     // Recognized but kept as written: recorded, then walked
                     // like anything else.
+                    if kept.is_none() {
+                        let holes = m
+                            .holes
+                            .iter()
+                            .filter_map(|h| index_range(nodes, h.nodes))
+                            .collect();
+                        kept = Some((i + m.consumed, holes));
+                    }
                     self.matches.push(m);
                 }
             }
@@ -167,6 +216,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
                         atoms: vec![self.read_style(atom)],
                         kind: OccKind::Char,
                         parts: Vec::new(),
+                        bare_arg: false,
                     });
                     return true;
                 }
@@ -181,6 +231,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
                         atoms: vec![atom],
                         kind: OccKind::Name,
                         parts: Vec::new(),
+                        bare_arg: false,
                     });
                     true
                 } else {
@@ -221,9 +272,12 @@ impl<'a, 'n> Resolver<'a, 'n> {
             let mut complete = transparent;
             for arg in &c.args {
                 match arg {
-                    Arg::Math(n) | Arg::Delim(n) => {
-                        complete &= self.walk(std::slice::from_ref(n), out)
+                    Arg::Math(n) => {
+                        let from = out.len();
+                        complete &= self.walk(std::slice::from_ref(n), out);
+                        mark_bare_arg(n, &mut out[from..]);
                     }
+                    Arg::Delim(n) => complete &= self.walk(std::slice::from_ref(n), out),
                     Arg::Text(t) => {
                         for r in &t.regions {
                             self.walk(&r.nodes, out);
@@ -242,6 +296,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
                     atoms: vec![atom],
                     kind: OccKind::Name,
                     parts: Vec::new(),
+                    bare_arg: false,
                 });
                 return true;
             }
@@ -318,6 +373,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
             atoms,
             kind: OccKind::StyledGroup,
             parts,
+            bare_arg: false,
         });
         true
     }
@@ -386,7 +442,9 @@ impl<'a, 'n> Resolver<'a, 'n> {
         let walk_args = |this: &mut Self, out: &mut Vec<Occurrence>| {
             for arg in &c.args {
                 if let Arg::Math(n) = arg {
+                    let from = out.len();
                     this.walk(std::slice::from_ref(n), out);
+                    mark_bare_arg(n, &mut out[from..]);
                 }
             }
         };
@@ -438,10 +496,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
             depth: self.depth + 1,
             diags: Vec::new(),
             notations: &[],
-            matcher: Matcher {
-                table: self.table,
-                doc_src: &expansion,
-            },
+            matcher: Matcher::new(self.table, self.sigs, &expansion, &[]),
             matches: Vec::new(),
         };
         let mut inner = Vec::new();
@@ -489,6 +544,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
             atoms,
             kind: OccKind::MacroCall,
             parts,
+            bare_arg: false,
         });
         true
     }

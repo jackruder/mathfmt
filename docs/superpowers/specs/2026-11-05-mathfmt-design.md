@@ -820,3 +820,82 @@ Fifteen findings; all accepted.
   the root; conditionals; a subfile with its own `\documentclass`; a check
   that a committed declarations file is current; declarations for the
   literals of a notation form no source uses yet.
+
+### 2026-11-09, the second review
+
+An independent review of the three waves of 2026-11-08 (style
+distribution, `--verify`, notations) returned twenty-two findings, all
+reproduced; `docs/REVIEW-2026-11-09.md` lists them with what was done. The
+behaviour that changed:
+
+- **§9, a style group is one unit.** A structured style group
+  (`\mathbf{x^2}`) spelled piece by piece is wrapped in braces when a script
+  or a prime follows it, unless it is already one group or one command over
+  one group: `\mathbf{x^2}^3` is `{𝐱^{𝟐}}^3`, where `𝐱^{𝟐}^3` was a double
+  superscript. Text is one group only when the brace that opens it closes
+  it at the end: `{𝐱}_{𝟏}` as a script operand is braced whole.
+- **§9, an unbraced argument stays one argument.** The resolver marks an
+  occurrence that is the whole of an unbraced math argument of a command
+  (`\hat\alpha`, each of `\frac\alpha\beta`). Its replacement is braced when
+  it is not ASCII or holds a group, as a script operand is: `\hat{α}`,
+  `\frac{α}{β}`, `\hat{\mathbf{x}}`. A macro takes one token, which under
+  pdflatex is one byte of the character and under any engine the bare
+  `\mathbf` of a wrapper. Two such arguments never merge into one wrapper.
+  Delimiter arguments (`\left⟨`, `\big⟨`) are left alone: `\left{⟨}` is not
+  TeX.
+- **§8, forms.** A form must hold something literal, balanced braces and no
+  comment, and its first and last tokens must not be holes; the config
+  refuses it otherwise. (A form of holes alone matched everything and
+  overflowed the stack; a hole at the edge bound back to the start of the
+  region.) Forms are tried most specific first across all notations, ties
+  by notation name and then form name: the order no longer depends on which
+  notation comes first, and `notations in config order` in the amendment of
+  2026-11-08 is withdrawn, the config's map having no order to keep.
+- **§8, holes.** A bare hole binds the shortest run that is balanced in its
+  delimiters (parentheses, brackets, `\{ \}`, `\langle \rangle`, floors,
+  ceilings, `\left \right`, kinds not told apart so `[0, 1)` is balanced)
+  and lets the rest match; a run that closes a delimiter it did not open
+  ends the search, which also bounds it (1600 terms: 20 s before, under a
+  tenth of a second now). `D_{\mathrm{KL}}(p \| q(x))` binds `q(x)`.
+- **§8, what is never a match.** A stretch holding a `%` comment or an
+  unclosed group. (The first cut a rewritten form in two; the second let a
+  match run to the end of the file and delete it.) A document group
+  standing alone in a list is not its content; one that is a script operand
+  or a command's argument is. This replaces the first-node rule of
+  2026-11-08 and covers what it covered.
+- **§8, styled literals.** A style command over one base (`\mathbb{E}`) in a
+  form or in the document is the atom its character is, so `𝔼_{x ∼ p}[f]`
+  matches `\mathbb{E}_#1[#2]` and a notation round-trips through Unicode.
+- **§9, rewriting.** Where the form supplies the grouping, a binding that is
+  itself one group loses its braces first: a hole written `{#1}` or sitting
+  after `^` or `_`. `_{x ∼ p}` moved into `\E{#1}{#2}` is `\E{x \sim p}{f}`,
+  and writing a form over itself no longer adds a pair per run. A notation
+  that is itself a script operand is kept as written and recorded as not
+  rewritten. The filled form is converted without inlining macros: a form
+  that writes `\R^{#1}` was chosen for its `\R`. A notation kept as written
+  starts no other match from its literals, so it is counted once.
+- **§11, `--verify`.** Every document is a root, and so is every FILE that
+  no document among the FILEs reads, by the project reader: a snippet
+  beside a document is verified, where it was silently passed over. Each
+  root gets a verdict; a root that cannot be set up or whose original does
+  not compile reports `error:` and the run exits 2 after printing the
+  others. A document's copy holds the sources under its own directory; a
+  changed source it reads from outside is an error, since the copy cannot
+  place it, and a source of another document is ignored, so documents in
+  sibling directories verify side by side. `--keep DIR` may be relative; a
+  build directory carries a marker file, one that has it is cleared before
+  use and one that lacks it and is not empty is refused. The directories of
+  the definition files are on `TEXINPUTS`. A `\documentclass` in a comment
+  makes no document. `--dpi` is held to 50…2400.
+- **`declarations`.** The atoms of a notation's literals count: the sources
+  are read with no form chosen. (Found by the compile check on the fixture
+  for styled literals: the `𝒩` of a rewritten `𝒩(μ, Σ)` went undeclared.)
+- **§14.** Thirteen fixtures, one per defect that a fixture can pin, and
+  three tests in `tests/verify.rs` for several roots, kept builds and macro
+  packages.
+- **Ruled on, not changed.** An unterminated region's warning says `left as
+  is` while its symbols are still converted, as since version zero; the
+  wording is the fault. `--verify` may add fonts to the user's TeX cache
+  (bbm is METAFONT only), as any compile does. A `differs` fixture that
+  holds several cases can hide one of them changing; the cases are split
+  when one does.

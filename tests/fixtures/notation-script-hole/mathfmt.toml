@@ -1,0 +1,5 @@
+[notations.ev]
+macro = "\\ev{#1}{#2}"
+sub   = "\\operatorname{E}_#1[#2]"
+[profiles.unicode.notations]
+ev = "sub"

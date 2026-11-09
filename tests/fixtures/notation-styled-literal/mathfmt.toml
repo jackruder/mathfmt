@@ -1,0 +1,9 @@
+[notations.E]
+macro = "\\E{#1}{#2}"
+sub   = "\\mathbb{E}_#1[#2]"
+[notations.N]
+macro    = "\\N(#1, #2)"
+expanded = "\\mathcal{N}(#1, #2)"
+[profiles.ascii.notations]
+E = "macro"
+N = "macro"

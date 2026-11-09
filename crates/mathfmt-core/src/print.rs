@@ -33,7 +33,28 @@ pub fn plan(
     let mut planned: Vec<(Span, Option<String>)> = Vec::with_capacity(occurrences.len());
     for occ in &occurrences {
         match spell_occurrence(occ, profile, table) {
-            Ok(text) => planned.push((occ.span, Some(text))),
+            Ok(mut text) => {
+                // A style group that had scripts or braces inside was one
+                // unit to whatever follows it. Spelled piece by piece it is
+                // not, so a script or prime after it would attach to its
+                // last piece (`\mathbf{x^2}^3` → `𝐱^{𝟐}^3`, a double
+                // superscript): it keeps a group of its own.
+                if !occ.is_flat()
+                    && text != occ.span.text(src)
+                    && !is_one_unit(&text)
+                    && followed_by_script(&src[occ.span.end..])
+                {
+                    text = format!("{{{text}}}");
+                }
+                // An unbraced argument (`\hat\alpha`) must stay one
+                // argument: a macro takes one token, which is one byte of a
+                // multi-byte character under pdflatex and the bare command
+                // of `\mathbf{x}`.
+                if occ.bare_arg && text != occ.span.text(src) && needs_script_braces(&text) {
+                    text = format!("{{{text}}}");
+                }
+                planned.push((occ.span, Some(text)));
+            }
             Err(atom) => {
                 diags.push(Diagnostic::warning(
                     "no-latex-spelling",
@@ -65,11 +86,11 @@ pub fn plan(
             Some((prev_span, Some(prev_text))) if prev_span.end == span.start => prev_text.as_str(),
             _ => &src[..span.start],
         };
-        if ends_with_control_word(before) && starts_alphabetic(&text) {
-            text.insert(0, ' ');
-        }
         if is_script_operand(&src[..span.start]) && needs_script_braces(&text) {
             text = format!("{{{text}}}");
+        }
+        if ends_with_control_word(before) && starts_alphabetic(&text) {
+            text.insert(0, ' ');
         }
         // what comes just after
         let after_first: Option<char> = match planned.get(i + 1) {
@@ -131,6 +152,8 @@ fn merge_runs(occurrences: Vec<Occurrence>, profile: &Profile) -> Vec<Occurrence
         if let Some(last) = out.last_mut() {
             if last.is_flat()
                 && occ.is_flat()
+                && !last.bare_arg
+                && !occ.bare_arg
                 && last.span.end == occ.span.start
                 && same_single_style(&last.atoms, &occ.atoms)
             {
@@ -381,9 +404,52 @@ pub(crate) fn is_script_operand(before: &str) -> bool {
 
 /// A script operand that is a multi-byte character (pdflatex reads it a byte
 /// at a time) or a command with an argument (`x_\boldsymbol{\theta}` is
-/// "Missing { inserted") needs braces; a bare control word or ASCII does not.
+/// "Missing { inserted") needs braces; a bare control word or ASCII does
+/// not, and neither does text that is already one group. Text that only
+/// starts with a group is not one (`{𝐱}_{𝟏}`).
 pub(crate) fn needs_script_braces(text: &str) -> bool {
-    !text.starts_with('{') && (!text.is_ascii() || text.contains('{'))
+    one_group_contents(text).is_none() && (!text.is_ascii() || text.contains('{'))
+}
+
+/// What is inside the braces, when `text` is exactly one balanced group.
+pub(crate) fn one_group_contents(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && i + 1 != bytes.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (depth == 0).then(|| &text[1..text.len() - 1])
+}
+
+/// One group, or one command over one group (`\boldsymbol{\sigma_\theta}`):
+/// a script after it attaches to all of it.
+fn is_one_unit(text: &str) -> bool {
+    let rest = match crate::lex::lex_one(text, 0) {
+        Some(t) if t.kind == crate::lex::TokKind::ControlWord => &text[t.span.end..],
+        _ => text,
+    };
+    one_group_contents(rest).is_some() && !rest.starts_with(char::is_whitespace)
+}
+
+/// Does a `^`, `_` or prime come next, spaces aside?
+fn followed_by_script(after: &str) -> bool {
+    after.trim_start().starts_with(['^', '_', '\''])
 }
 
 #[cfg(test)]
@@ -454,6 +520,69 @@ mod tests {
             out,
             r"$\mathbf{xy} \mathbf{xy} \mathbf{x}_t\mathbf{y} \mathbf{x}\boldsymbol{\alpha}$"
         );
+    }
+
+    #[test]
+    fn a_structured_group_stays_one_unit_before_a_script() {
+        let (u, _) = convert(
+            r"$\mathbf{x^2}^3 \mathbf{x_t}^2 \mathbf{x^2}' \mathbf{x_1} + y$",
+            "unicode",
+        );
+        assert_eq!(
+            u, "${𝐱^{𝟐}}^3 {𝐱_{𝐭}}^2 {𝐱^{𝟐}}' 𝐱_{𝟏} + y$",
+            "a script after the group attaches to all of it; none after, no braces"
+        );
+        let (a, _) = convert(
+            r"$\mathbf{\sigma^x}^2 \mathfrak{I_x}_2 \bm{\mu_k}^2$",
+            "ascii",
+        );
+        assert_eq!(
+            a,
+            r"${\boldsymbol{\sigma}^{\mathbf{x}}}^2 {\Im_{\mathfrak{x}}}_2 \boldsymbol{\mu_k}^2$",
+            "pieces get a group; one wrapper over the whole is already a unit"
+        );
+        for (out, profile) in [(&u, "unicode"), (&a, "ascii")] {
+            assert_eq!(&convert(out, profile).0, out, "stable under {profile}");
+        }
+    }
+
+    #[test]
+    fn a_group_as_a_script_operand_is_braced_whole() {
+        let (u, _) = convert(
+            r"$y^\mathbf{{x}_1} x^\mathbf{{a}{b}} z_\mathbf{{w}}$",
+            "unicode",
+        );
+        assert_eq!(
+            u, "$y^{{𝐱}_{𝟏}} x^{{𝐚}{𝐛}} z_{𝐰}$",
+            "text that only starts with a group is not one group"
+        );
+        let (a, _) = convert(r"$y^\mathbf{{\sigma}_1}$", "ascii");
+        assert_eq!(a, r"$y^{{\boldsymbol{\sigma}}_{\mathbf{1}}}$");
+        assert_eq!(one_group_contents("{a}{b}"), None);
+        assert_eq!(one_group_contents(r"{a\}b}"), Some(r"a\}b"));
+        assert_eq!(one_group_contents("{{a}_1}"), Some("{a}_1"));
+        assert_eq!(one_group_contents("a"), None);
+    }
+
+    #[test]
+    fn an_unbraced_argument_stays_one_argument() {
+        let (u, _) = convert(
+            r"$\hat\alpha + \frac\alpha\beta + \vec\mu + \sqrt\alpha + \hat{\alpha} + \bar x$",
+            "unicode",
+        );
+        assert_eq!(
+            u, r"$\hat{α} + \frac{α}{β} + \vec{μ} + \sqrt{α} + \hat{α} + \bar x$",
+            "a macro would take one byte of the character under pdflatex"
+        );
+        let (a, _) = convert(r"$\hat 𝐱 + \frac 𝐱𝐲 + \hat α + \frac{𝐱}{𝐲}𝐱𝐲$", "ascii");
+        assert_eq!(
+            a,
+            r"$\hat {\mathbf{x}} + \frac {\mathbf{x}}{\mathbf{y}} + \hat \alpha + \frac{\mathbf{x}}{\mathbf{y}}\mathbf{xy}$",
+            "a wrapper is braced, a control word is not, and two arguments never merge"
+        );
+        for (out, profile) in [(&u, "unicode"), (&a, "ascii")] {
+            assert_eq!(&convert(out, profile).0, out, "stable under {profile}");
+        }
     }
 
     #[test]

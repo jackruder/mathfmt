@@ -1,0 +1,4 @@
+1:1: warning[unterminated-math]: math region never closed; left as is
+2:7: warning[unbalanced-brace]: a { with no matching }
+4:18: warning[unexpected-dollar]: a $ inside a math region; left as is
+4:20: warning[unexpected-dollar]: a $ inside a math region; left as is

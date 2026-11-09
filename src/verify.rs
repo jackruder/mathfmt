@@ -24,6 +24,7 @@
 //! before `\begin{document}` on both sides, which shows what the document
 //! would render as once its preamble holds them.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,7 +32,11 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
 
-use mathfmt_core::{Engine, Mechanism, Profile};
+use mathfmt_core::{Engine, Mechanism, Profile, Project};
+
+/// Left in a build directory mathfmt made, so that a later run with the
+/// same `--keep` may clear it and nothing else.
+const MARKER: &str = ".mathfmt-verify";
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -88,11 +93,19 @@ pub enum Verdict {
     PageCount { original: usize, converted: usize },
     /// The converted source does not compile (the original does).
     Broken { excerpt: String },
+    /// There is nothing to compare: the original does not compile, or the
+    /// build could not be set up.
+    Error { message: String },
 }
 
 impl Verdict {
     pub fn is_failure(&self) -> bool {
         !matches!(self, Verdict::Unchanged | Verdict::Identical { .. })
+    }
+
+    /// No verdict could be reached: exit status 2, not a difference.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Verdict::Error { .. })
     }
 }
 
@@ -176,6 +189,14 @@ impl Report {
                 }
                 Ok(())
             }
+            Verdict::Error { message } => {
+                let mut lines = message.lines();
+                write!(f, "error: {}", lines.next().unwrap_or(""))?;
+                for line in lines {
+                    write!(f, "\n  {line}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -188,16 +209,35 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-/// Does this source carry its own `\documentclass` (outside comments)?
-pub fn is_document(text: &str) -> bool {
-    text.lines().any(|l| {
-        let l = l.trim_start();
-        !l.starts_with('%') && l.contains("\\documentclass")
-    })
+/// The part of a line before its comment, if it has one.
+fn code_part(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'%' => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
 }
 
-/// Verify every root (document, or each snippet when there is no document).
-/// Roots are compiled in parallel.
+/// Does this source carry its own `\documentclass` (outside comments)?
+pub fn is_document(text: &str) -> bool {
+    text.lines()
+        .any(|l| code_part(l).contains("\\documentclass"))
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Verify every root: each document, and each snippet that no document
+/// among the sources reads (a file a document inputs is verified as part of
+/// it). Roots are compiled in parallel, and each gets a verdict: one that
+/// cannot be compiled does not take the others' with it.
 pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
     if sources.is_empty() {
         return Ok(Vec::new());
@@ -210,8 +250,25 @@ pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
     }
     check_tool("pdftoppm")?;
     let any_document = sources.iter().any(|s| is_document(s.original));
+    // What the documents read, by the project reader.
+    let mut read_by_a_document: BTreeSet<PathBuf> = BTreeSet::new();
+    for s in sources.iter().filter(|s| is_document(s.original)) {
+        if let Ok(project) = Project::read(&s.path) {
+            read_by_a_document.extend(
+                project
+                    .files
+                    .iter()
+                    .chain(&project.definitions)
+                    .map(|f| canonical(f)),
+            );
+        }
+    }
     let roots: Vec<usize> = (0..sources.len())
-        .filter(|&i| !any_document || is_document(sources[i].original))
+        .filter(|&i| {
+            let s = &sources[i];
+            is_document(s.original)
+                || (s.project.is_none() && !read_by_a_document.contains(&canonical(&s.path)))
+        })
         .collect();
     let base = match &opts.keep {
         Some(dir) => {
@@ -231,7 +288,11 @@ pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
             dir
         }
     };
-    let reports: Vec<Result<Report>> = roots
+    // The engine runs from another directory: its output directory must
+    // not be relative to ours.
+    let base =
+        std::fs::canonicalize(&base).with_context(|| format!("resolving {}", base.display()))?;
+    let reports: Vec<Report> = roots
         .par_iter()
         .enumerate()
         .map(|(n, &i)| {
@@ -243,17 +304,56 @@ pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ));
-            verify_root(root, sources, &dir, opts).map(|(verdict, declared)| Report {
+            let (verdict, declared) = fresh_dir(&dir)
+                .and_then(|()| verify_root(root, sources, &dir, opts))
+                .unwrap_or_else(|e| {
+                    let mut message = format!("{e:#}");
+                    if any_document && !is_document(root.original) {
+                        message.push_str(&format!(
+                            "\n(no document among the FILEs reads {}, so it was compiled on its own, as a snippet)",
+                            root.path.display()
+                        ));
+                    }
+                    (Verdict::Error { message }, 0)
+                });
+            Report {
                 root: root.path.clone(),
                 verdict,
                 declared,
-            })
+            }
         })
         .collect();
     if opts.keep.is_none() {
         let _ = std::fs::remove_dir_all(&base);
     }
-    reports.into_iter().collect()
+    Ok(reports)
+}
+
+/// An empty build directory at `dir`. One left by an earlier run is cleared
+/// (its pages and copies would be read as this run's); a directory mathfmt
+/// did not make is not touched.
+fn fresh_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        let ours = dir.join(MARKER).is_file();
+        let empty = std::fs::read_dir(dir)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if ours {
+            std::fs::remove_dir_all(dir).with_context(|| format!("clearing {}", dir.display()))?;
+        } else if !empty {
+            bail!(
+                "{} exists and was not made by mathfmt; remove it or keep the build somewhere else",
+                dir.display()
+            );
+        }
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(
+        dir.join(MARKER),
+        "a mathfmt --verify build; a later run with the same --keep clears it\n",
+    )
+    .with_context(|| format!("writing in {}", dir.display()))?;
+    Ok(())
 }
 
 fn check_tool(name: &str) -> Result<()> {
@@ -307,10 +407,40 @@ fn verify_root(
     opts: &Options,
 ) -> Result<(Verdict, usize)> {
     let document = is_document(root.original);
-    // A document is compiled with the files of its own project.
-    let all: Vec<&Source<'_>> = all.iter().filter(|s| s.project == root.project).collect();
+    let root_dir = root
+        .path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root_dir = std::fs::canonicalize(&root_dir)
+        .with_context(|| format!("resolving {}", root_dir.display()))?;
+    // A document is compiled from a copy of its directory holding the
+    // sources that live there (in project mode, those of its own project).
+    // A source elsewhere is another document's, unless this one reads it:
+    // then the copy cannot hold it, and saying so beats comparing the
+    // original with itself.
+    let mut parts: Vec<(&Source<'_>, PathBuf)> = Vec::new();
+    if document {
+        let reads: BTreeSet<PathBuf> = Project::read(&root.path)
+            .map(|p| p.files.iter().map(|f| canonical(f)).collect())
+            .unwrap_or_default();
+        for s in all.iter().filter(|s| s.project == root.project) {
+            match relative_to(&root_dir, &s.path) {
+                Ok(rel) => parts.push((s, rel)),
+                Err(_) if s.original != s.converted && reads.contains(&canonical(&s.path)) => {
+                    bail!(
+                        "{} reads {} from outside its own directory; --verify compiles from a copy of that directory and cannot place the file in it",
+                        root.path.display(),
+                        s.path.display()
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
     if root.original == root.converted
-        && (!document || all.iter().all(|s| s.original == s.converted))
+        && (!document || parts.iter().all(|(s, _)| s.original == s.converted))
     {
         return Ok((Verdict::Unchanged, 0));
     }
@@ -323,14 +453,6 @@ fn verify_root(
             .filter(|l| !l.trim_start().starts_with('%') && !l.trim().is_empty())
             .count()
     });
-    let root_dir = root
-        .path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let root_dir = std::fs::canonicalize(&root_dir)
-        .with_context(|| format!("resolving {}", root_dir.display()))?;
     let root_name = root
         .path
         .file_name()
@@ -349,15 +471,14 @@ fn verify_root(
         std::fs::create_dir_all(&src_dir)?;
         std::fs::create_dir_all(&out_dir)?;
         let job_name = if document {
-            for s in &all {
+            for (s, rel) in &parts {
                 let text = if converted { s.converted } else { s.original };
                 let injected = match declare {
                     Some(block) if std::ptr::eq(*s, root) => inject(text, block),
                     _ => None,
                 };
                 let text = injected.as_deref().unwrap_or(text);
-                let rel = relative_to(&root_dir, &s.path)?;
-                let target = src_dir.join(&rel);
+                let target = src_dir.join(rel);
                 if let Some(p) = target.parent() {
                     std::fs::create_dir_all(p)?;
                 }
@@ -385,7 +506,7 @@ fn verify_root(
 
     let mut pdfs = Vec::new();
     for (i, (src_dir, out_dir, job)) in jobs.iter().enumerate() {
-        match compile(&root.program, src_dir, out_dir, job, &root_dir, root)? {
+        match compile(&root.program, src_dir, out_dir, job, &root_dir, root, opts)? {
             Ok(pdf) => pdfs.push(pdf),
             Err(excerpt) => {
                 if i == 0 {
@@ -460,11 +581,32 @@ fn compile(
     job: &Path,
     root_dir: &Path,
     root: &Source<'_>,
+    opts: &Options,
 ) -> Result<Result<PathBuf, String>> {
-    // The copy first, then the document's own directory, then the defaults.
-    let mut texinputs = format!("{}:{}:", src_dir.display(), root_dir.display());
-    if let Some(config_dir) = &root.engine.config.dir {
-        texinputs = format!("{}{}:", texinputs, config_dir.display());
+    // The copy first, then the document's own directory, then the config's
+    // and the directories of the definition files mathfmt was given (a
+    // snippet's wrapper loads those by name), then the defaults.
+    let mut dirs: Vec<PathBuf> = vec![src_dir.to_path_buf(), root_dir.to_path_buf()];
+    let config = &root.engine.config;
+    if let Some(config_dir) = &config.dir {
+        dirs.push(config_dir.clone());
+    }
+    let config_macros = config.macros.iter().map(|m| match &config.dir {
+        Some(d) => d.join(m),
+        None => PathBuf::from(m),
+    });
+    for m in config_macros.chain(opts.macros.iter().cloned()) {
+        if let Some(parent) = canonical(&m).parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    let mut texinputs = String::new();
+    let mut seen: BTreeSet<&Path> = BTreeSet::new();
+    for d in &dirs {
+        if seen.insert(d.as_path()) {
+            texinputs.push_str(&d.display().to_string());
+            texinputs.push(':');
+        }
     }
     let output = Command::new(engine)
         .current_dir(src_dir)
@@ -770,6 +912,42 @@ mod tests {
             "\\documentclass{article}\n% \\begin{document}\n\\title{50\\% off}\\usepackage{bbm}\n\\begin{document}\nx\n\\begin{document}\n"
         );
         assert!(inject("no document here\n% \\begin{document}\n", "x").is_none());
+    }
+
+    #[test]
+    fn a_build_directory_is_cleared_only_when_it_is_ours() {
+        let base = std::env::temp_dir().join(format!("mathfmt-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ours = base.join("0-main");
+        fresh_dir(&ours).unwrap();
+        std::fs::write(ours.join("stale-page.pgm"), "old").unwrap();
+        fresh_dir(&ours).unwrap();
+        assert!(
+            !ours.join("stale-page.pgm").exists(),
+            "a stale page is gone"
+        );
+        assert!(ours.join(MARKER).is_file());
+        let theirs = base.join("1-notes");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("thesis.tex"), "precious").unwrap();
+        assert!(fresh_dir(&theirs).is_err());
+        assert_eq!(
+            std::fs::read_to_string(theirs.join("thesis.tex")).unwrap(),
+            "precious",
+            "a directory mathfmt did not make is left alone"
+        );
+        let empty = base.join("2-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(fresh_dir(&empty).is_ok(), "an empty directory is fine");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_comment_that_mentions_documentclass_makes_no_document() {
+        assert!(!is_document("$\\alpha$ % unlike a \\documentclass line\n"));
+        assert!(is_document("\\documentclass{article} % the class\n"));
+        assert!(is_document("50\\% of \\documentclass{article}\n"));
+        assert_eq!(code_part("a \\% b % c"), "a \\% b ");
     }
 
     #[test]

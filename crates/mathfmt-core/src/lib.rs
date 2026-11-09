@@ -224,14 +224,20 @@ impl Engine {
         }
     }
 
-    /// Every atom these sources use, before or after conversion.
+    /// Every atom these sources use, before or after conversion. The
+    /// literals of a notation count: they are read with no form chosen, so
+    /// a match is walked like anything else instead of being replaced.
     fn atoms_used(&self, sources: &[&str], profile: &Profile) -> BTreeSet<Atom> {
+        let reading = Profile {
+            notations: Default::default(),
+            ..profile.clone()
+        };
+        let none = RenameMap::new();
         let mut atoms = BTreeSet::new();
         for src in sources {
-            let first = self.convert(src, profile, &RenameMap::new());
-            let again = self.convert(&first.output, profile, &RenameMap::new());
-            for outcome in [&first, &again] {
-                for occ in &outcome.occurrences {
+            let converted = self.convert(src, profile, &none).output;
+            for text in [*src, converted.as_str()] {
+                for occ in &self.convert(text, &reading, &none).occurrences {
                     atoms.extend(occ.atoms.iter().copied());
                 }
             }
@@ -368,7 +374,7 @@ impl Engine {
                     form: n.forms[m.form].name.clone(),
                     span: m.span,
                     holes: m.holes.iter().map(|b| b.span).collect(),
-                    rewritten: profile.notations.contains_key(&n.name),
+                    rewritten: m.rewritten,
                 }
             })
             .collect();
@@ -387,7 +393,9 @@ impl Engine {
     }
 
     /// Convert a rendered notation form (math only, no notations) so its
-    /// literals come out in the profile's spellings.
+    /// literals come out in the profile's spellings. Macros are not inlined
+    /// here: a form that writes `\R` was chosen for it, and the holes were
+    /// already converted under the profile's own setting.
     fn convert_fragment(
         &self,
         text: &str,
@@ -406,9 +414,13 @@ impl Engine {
             macros: macros.clone(),
             diagnostics: Vec::new(),
         };
+        let literal = Profile {
+            inline_macros: false,
+            ..profile.clone()
+        };
         let (occurrences, _, _) =
-            resolve::resolve(&doc, text, &self.table, &self.signatures, profile, &[]);
-        let (edits, _) = print::plan(text, &occurrences, profile, &self.table, rename);
+            resolve::resolve(&doc, text, &self.table, &self.signatures, &literal, &[]);
+        let (edits, _) = print::plan(text, &occurrences, &literal, &self.table, rename);
         print::apply(text, &edits)
     }
 
@@ -620,6 +632,121 @@ mod tests {
         assert!(native.chars.is_empty());
         assert_eq!(native.packages.keys().collect::<Vec<_>>(), ["unicode-math"]);
         assert!(engine.declarations(&["no math"], &unicode, None).is_empty());
+    }
+
+    fn engine_with(config: &str) -> Engine {
+        Engine::new(Config::parse(config, None).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_notation_round_trips_through_styled_literals_and_scripts() {
+        let engine = engine_with(
+            r#"
+            [notations.E]
+            macro = "\\E{#1}{#2}"
+            sub = "\\mathbb{E}_#1[#2]"
+            [notations.N]
+            macro = "\\N(#1, #2)"
+            expanded = "\\mathcal{N}(#1, #2)"
+            [profiles.ascii.notations]
+            E = "macro"
+            N = "macro"
+            [profiles.unicode.notations]
+            E = "sub"
+            N = "expanded"
+            "#,
+        );
+        let ascii = engine.profile(Some("ascii")).unwrap();
+        let unicode = engine.profile(Some("unicode")).unwrap();
+        let none = RenameMap::new();
+        let u = "$𝔼_{x ∼ p}[f] + 𝒩(μ, Σ)$";
+        let a = r"$\E{x \sim p}{f} + \N(\mu, \Sigma)$";
+        assert_eq!(
+            engine.convert(u, &ascii, &none).output,
+            a,
+            "the characters are the form's styled literals, and the script's braces are not kept as a second pair"
+        );
+        assert_eq!(
+            engine
+                .convert(
+                    r"$\mathbb{E}_{x \sim p}[f] + \mathcal{N}(\mu, \Sigma)$",
+                    &ascii,
+                    &none
+                )
+                .output,
+            a
+        );
+        assert_eq!(engine.convert(a, &unicode, &none).output, u);
+        for (text, profile) in [(u, &unicode), (a, &ascii)] {
+            assert_eq!(engine.convert(text, profile, &none).output, text, "stable");
+        }
+    }
+
+    #[test]
+    fn a_notation_is_kept_where_a_rewrite_could_not_be_trusted() {
+        let config = r#"
+            [notations.KL]
+            macro = "\\KL{#1}{#2}"
+            expanded = "D_{\\mathrm{KL}}(#1 \\| #2)"
+            [notations.Rn]
+            short = "\\R^{#1}"
+            long = "\\mathbb{R}^{#1}"
+            [profiles.unicode.notations]
+            KL = "expanded"
+            Rn = "short"
+            "#;
+        let engine = engine_with(config);
+        let unicode = engine.profile(Some("unicode")).unwrap();
+        let none = RenameMap::new();
+        let out = |src: &str| engine.convert(src, &unicode, &none);
+        // An unclosed group: the match would run to the end of the file.
+        assert_eq!(out("$\\KL{p}{q$ and text").output, "$\\KL{p}{q$ and text");
+        // A comment: the rewrite would swallow what follows it.
+        let commented = "$\\KL{p % first\n}{q}$";
+        assert_eq!(out(commented).output, commented);
+        assert_eq!(
+            out("$D_{\\mathrm{KL}}(p % c\n\\| q)$").output,
+            "$D_{\\mathrm{KL}}(p % c\n‖ q)$",
+            "left as written, its symbols still converted"
+        );
+        // A script operand: what the script takes is the macro's business.
+        let script = out(r"$e^\KL{p}{q} + \KL{p}{q}$");
+        assert_eq!(script.output, r"$e^\KL{p}{q} + D_{\mathrm{KL}}(p ‖ q)$");
+        assert_eq!(
+            script
+                .notations
+                .iter()
+                .map(|n| n.rewritten)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        // The form a profile picks is written as it is: its \R is not
+        // inlined, though a lone \R still is.
+        let defs = "\\newcommand{\\R}{\\mathbb{R}}\n";
+        assert_eq!(
+            out(&format!("{defs}$\\mathbb{{R}}^{{n}} + \\R^{{d}} + \\R$")).output,
+            format!("{defs}$\\R^{{n}} + \\R^{{d}} + ℝ$")
+        );
+        // A form of holes alone, or with a hole at its edge, is refused.
+        for bad in [
+            "[notations.w]\nbare = \"#1\"",
+            "[notations.ip]\ndot = \"#1 \\\\cdot #2\"",
+            "[notations.w]\nopen = \"\\\\foo{#1\"",
+        ] {
+            assert!(Config::parse(bad, None).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_notation_kept_as_written_is_counted_once() {
+        let engine = engine_with("[notations.abs]\nbars = \"|#1|\"\nmacro = \"\\\\abs{#1}\"");
+        let p = engine.profile(None).unwrap();
+        let inv = engine.notation_inventory("$|a|b|$ and $|(|x|)|$", &p);
+        assert_eq!(
+            (inv[0].count, inv[0].forms["bars"]),
+            (3, 3),
+            "|a| once, not |b| again from its closing bar; the nested |x| inside the hole of |(|x|)| is its own"
+        );
     }
 
     #[test]

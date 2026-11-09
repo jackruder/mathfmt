@@ -428,3 +428,69 @@ fn declarations_and_project_say_what_the_root_has_and_needs() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn emit_lists_notations_and_whether_each_is_rewritten() {
+    let dir = temp_dir("emit-notations");
+    write_tree(
+        &dir,
+        &[
+            (
+                "mathfmt.toml",
+                "[notations.KL]\nmacro = \"\\\\KL{#1}{#2}\"\nexpanded = \"D_{\\\\mathrm{KL}}(#1 \\\\| #2)\"\n[profiles.unicode.notations]\nKL = \"expanded\"\n",
+            ),
+            ("a.tex", "$\\KL{p}{q} + e^\\KL{a}{b} + D_{\\mathrm{KL}}(r \\| s)$\n"),
+        ],
+    );
+    let (code, out, err) = run_in(&dir, &["--emit", "symbols", "a.tex"]);
+    assert_eq!(code, 0, "{err}");
+    let notation: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v.get("notation").is_some())
+        .collect();
+    assert_eq!(notation.len(), 1, "{out}");
+    assert_eq!(notation[0]["notation"], "KL");
+    assert_eq!(notation[0]["count"], 3);
+    assert_eq!(notation[0]["forms"]["macro"], 2);
+    assert_eq!(notation[0]["forms"]["expanded"], 1);
+    let (_, out, _) = run_in(&dir, &["--emit", "atoms", "a.tex"]);
+    let matches: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["kind"] == "notation")
+        .collect();
+    let seen: Vec<(String, bool)> = matches
+        .iter()
+        .map(|m| {
+            (
+                m["source"].as_str().unwrap().to_string(),
+                m["rewritten"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("\\KL{p}{q}".to_string(), true),
+            ("\\KL{a}{b}".to_string(), false),
+            ("D_{\\mathrm{KL}}(r \\| s)".to_string(), true),
+        ],
+        "a notation that is a script operand is seen and kept"
+    );
+    assert_eq!(matches[0]["holes"], serde_json::json!(["p", "q"]));
+    // A rename leaves the notation's shape alone and reaches into its holes.
+    let (code, out, err) = run_in(&dir, &["rename", "--from", "p", "--to", "p", "a.tex"]);
+    assert_eq!(
+        code, 2,
+        "a plain letter is not a symbol to rename: {out}{err}"
+    );
+    fs::write(dir.join("b.tex"), "$\\KL{\\alpha}{q}$\n").unwrap();
+    let (code, out, err) = run_in(
+        &dir,
+        &["rename", "--from", "\\alpha", "--to", "\\beta", "b.tex"],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "$D_{\\mathrm{KL}}(β ‖ q)$\n");
+    let _ = fs::remove_dir_all(&dir);
+}
