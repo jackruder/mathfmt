@@ -144,7 +144,12 @@ pub struct Profile {
     pub greek: Form,
     pub inline_macros: bool,
     pub script_reads_as: Style,
-    /// style name (or `bf_greek`, `bb_digit`) → command, possibly with `#1`.
+    /// The family its `style_commands` started from; under `unicode-math`
+    /// a symbol whose curated spelling that package lacks is spelled by
+    /// unicode-math's own name.
+    pub preset: StylePreset,
+    /// style name (or `bf_greek`, `bb_digit`, `bb_lower`) → command,
+    /// possibly with `#1`.
     pub style_commands: HashMap<String, String>,
     /// atom key or character → spelling.
     pub spellings: HashMap<String, String>,
@@ -180,6 +185,7 @@ const UNICODE_MATH_STYLE_COMMANDS: &[(&str, &str)] = &[
     ("bfit", "\\symbfit"),
     ("bb", "\\symbb"),
     ("bb_digit", "\\symbb"),
+    ("bb_lower", "\\symbb"),
     ("cal", "\\symcal"),
     ("scr", "\\symscr"),
     ("bfcal", "\\symbfcal"),
@@ -200,7 +206,10 @@ const DEFAULT_STYLE_COMMANDS: &[(&str, &str)] = &[
     ("bf_greek", "\\boldsymbol"),
     ("bfit", "\\boldsymbol"),
     ("bb", "\\mathbb"),
+    // amsfonts has neither blackboard digits nor lowercase (`\mathbb{a}`
+    // is some other glyph); bbm has both.
     ("bb_digit", "\\mathbbm"),
+    ("bb_lower", "\\mathbbm"),
     ("cal", "\\mathcal"),
     ("scr", "\\mathscr"),
     ("bfcal", "\\boldsymbol{\\mathcal{#1}}"),
@@ -212,7 +221,7 @@ const DEFAULT_STYLE_COMMANDS: &[(&str, &str)] = &[
     ("tt", "\\mathtt"),
 ];
 
-const STYLE_COMMAND_KEYS: &[&str] = &["bf_greek", "bb_digit"];
+const STYLE_COMMAND_KEYS: &[&str] = &["bf_greek", "bb_digit", "bb_lower"];
 
 impl Config {
     /// Parse a config file's text. `dir` is where relative `macros` resolve.
@@ -355,14 +364,14 @@ impl Config {
         }
         let base = builtin.unwrap_or(Form::Unicode);
         let user = user.cloned().unwrap_or_default();
-        let preset = match user.style_preset.unwrap_or(preset) {
+        let preset = user.style_preset.unwrap_or(preset);
+        let mut style_commands: HashMap<String, String> = match preset {
             StylePreset::Latex => DEFAULT_STYLE_COMMANDS,
             StylePreset::UnicodeMath => UNICODE_MATH_STYLE_COMMANDS,
-        };
-        let mut style_commands: HashMap<String, String> = preset
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        }
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
         style_commands.extend(user.style_commands.clone());
         Ok(Profile {
             name: name.to_string(),
@@ -374,6 +383,7 @@ impl Config {
                 Some("scr") => Style::Scr,
                 _ => Style::Cal,
             },
+            preset,
             style_commands,
             spellings: user.spellings.into_iter().collect(),
             notations: user
@@ -490,6 +500,8 @@ mod tests {
         assert_eq!(c.root_path(), Some(PathBuf::from("/paper/main.tex")));
         assert_eq!(c.engine.as_deref(), Some("lualatex"));
         let sym = c.profile("sym").unwrap();
+        assert_eq!(sym.preset, StylePreset::UnicodeMath);
+        assert_eq!(c.profile("ascii").unwrap().preset, StylePreset::Latex);
         assert_eq!(sym.style_commands["bf"], "\\symbf");
         assert_eq!(sym.style_commands["bf_greek"], "\\symbf");
         assert_eq!(sym.style_commands["sfit"], "\\symsfit");

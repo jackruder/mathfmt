@@ -631,12 +631,11 @@ impl<'a> Parser<'a> {
     fn parse_definition(&mut self, cmd: &str, tok: Token) {
         let save = self.pos;
         let ok = match cmd {
-            "newcommand" | "renewcommand" | "providecommand" | "DeclareRobustCommand" => {
-                self.def_newcommand()
-            }
+            "newcommand" | "renewcommand" | "DeclareRobustCommand" => self.def_newcommand(false),
+            "providecommand" => self.def_newcommand(true),
             "DeclareMathOperator" => self.def_operator(),
             "def" | "gdef" | "edef" | "xdef" => self.def_tex(),
-            _ => self.def_document_command(),
+            _ => self.def_document_command(cmd == "ProvideDocumentCommand"),
         };
         if !ok {
             self.pos = save;
@@ -648,7 +647,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn def_newcommand(&mut self) -> bool {
+    /// `\newcommand` and friends. With `provide`, as `\providecommand`: a
+    /// name that is already defined keeps its definition, so a section's
+    /// fallback does not override the package it falls back from.
+    fn def_newcommand(&mut self, provide: bool) -> bool {
         if self.peek() == Some('*') {
             self.pos += 1;
         }
@@ -688,6 +690,9 @@ impl<'a> Parser<'a> {
         } else {
             return false;
         };
+        if provide && (self.local.get(&name).is_some() || self.base.get(&name).is_some()) {
+            return true;
+        }
         self.local.insert(Macro {
             name,
             params,
@@ -769,10 +774,17 @@ impl<'a> Parser<'a> {
         true
     }
 
-    fn def_document_command(&mut self) -> bool {
+    fn def_document_command(&mut self, provide: bool) -> bool {
         let Some(name) = self.read_defined_name() else {
             return false;
         };
+        if provide && (self.local.get(&name).is_some() || self.base.get(&name).is_some()) {
+            // \ProvideDocumentCommand: read past the definition, keep what is.
+            self.skip_trivia();
+            self.read_balanced_group();
+            self.skip_trivia();
+            return self.read_balanced_group().is_some();
+        }
         self.skip_trivia();
         let Some(spec) = self.read_balanced_group() else {
             return false;
@@ -1203,6 +1215,33 @@ mod tests {
             (1, Some("x"))
         );
         assert!(d.diagnostics.is_empty(), "{:?}", d.diagnostics);
+    }
+
+    #[test]
+    fn providecommand_keeps_an_existing_definition() {
+        let sigs = Signatures::builtin();
+        let mut base = MacroTable::new();
+        base.insert(Macro::new("R", 0, "\\mathbb{R}"));
+        let src = "\\providecommand{\\R}{\\mathbf{R}} \\providecommand{\\Q}{\\mathbb{Q}}\n\
+                   \\ProvideDocumentCommand{\\Q}{}{\\mathbf{Q}} \\renewcommand{\\R}{\\mathrm{R}}";
+        let d = scan(src, &sigs, &ScanOptions::default(), &base);
+        assert_eq!(
+            d.macros.get("Q").unwrap().body,
+            "\\mathbb{Q}",
+            "the first definition stands"
+        );
+        assert_eq!(
+            d.macros.get("R").unwrap().body,
+            "\\mathrm{R}",
+            "\\renewcommand does replace"
+        );
+        let fresh = scan(
+            "\\providecommand{\\R}{\\mathbf{R}}",
+            &sigs,
+            &ScanOptions::default(),
+            &MacroTable::new(),
+        );
+        assert_eq!(fresh.macros.get("R").unwrap().body, "\\mathbf{R}");
     }
 
     #[test]

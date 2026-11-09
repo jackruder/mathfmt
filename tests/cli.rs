@@ -416,8 +416,10 @@ fn declarations_and_project_say_what_the_root_has_and_needs() {
          % packages the notation's commands need\n\
          \\usepackage{amsfonts}  % \\mathbb\n\
          \\usepackage{unicode-math-input}\n\
-         % styled letters, as the profile spells them (unicode-math-input follows pdflatex, which has no bold Greek under \\mathbf and no blackboard digits)\n\
+         % Unicode math input: each character means what the profile spells it as (unicode-math-input's own table lacks some and reads others differently)\n\
+         \\umiDeclareMathChar{α}{\\alpha}\n\
          \\umiDeclareMathChar{ℝ}{\\mathbb{R}}\n\
+         \\umiDeclareMathChar{∈}{\\in}\n\
          % ∆ (U+2206) is not declared: the tables have no LaTeX spelling for it; declare it by hand\n"
     );
     let (code, out, _) = run_stdin(&["declarations"], "no math here\n");
@@ -493,4 +495,61 @@ fn emit_lists_notations_and_whether_each_is_rewritten() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "$D_{\\mathrm{KL}}(β ‖ q)$\n");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_document_on_its_own_and_the_engine_flag_pick_the_unicode_math_commands() {
+    let dir = temp_dir("own-root");
+    write_tree(
+        &dir,
+        &[
+            (
+                "main.tex",
+                "% !TEX program = lualatex\n\\documentclass{article}\n\\usepackage{unicode-math}\n\\begin{document}\n$𝐱 ∈ ℝ$\n\\end{document}\n",
+            ),
+            ("s.tex", "$𝐱 ∈ ℝ$\n"),
+        ],
+    );
+    let (code, out, err) = run_in(&dir, &["-p", "ascii", "main.tex"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("$\\symbf{x} \\in \\symbb{R}$"),
+        "a document alone is its own root:\n{out}"
+    );
+    let (_, out, _) = run_in(&dir, &["-p", "ascii", "s.tex"]);
+    assert_eq!(
+        out, "$\\mathbf{x} \\in \\mathbb{R}$\n",
+        "a snippet assumes pdflatex"
+    );
+    let (_, out, _) = run_in(&dir, &["-p", "ascii", "--engine", "lualatex", "s.tex"]);
+    assert_eq!(
+        out, "$\\symbf{x} \\in \\symbb{R}$\n",
+        "--engine says what the commands assume"
+    );
+    let (_, out, _) = run_in(&dir, &["declarations", "--engine", "lualatex", "s.tex"]);
+    assert!(out.contains("unicode-math\n"), "{out}");
+    assert!(!out.contains("unicode-math-input"), "{out}");
+    fs::write(dir.join("mathfmt.toml"), "engine = \"lualatex\"\n").unwrap();
+    let (_, out, _) = run_in(&dir, &["-p", "ascii", "s.tex"]);
+    assert_eq!(
+        out, "$\\symbf{x} \\in \\symbb{R}$\n",
+        "so does `engine` in the config"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn options_before_a_subcommand_are_refused() {
+    let (code, out, err) = run_stdin(&["-p", "ascii", "declarations"], "$α$\n");
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(
+        err.contains("before the subcommand `declarations`"),
+        "{err}"
+    );
+    let (code, out, _) = run_stdin(&["declarations", "-p", "ascii"], "$α$\n");
+    assert_eq!(code, 0);
+    assert!(
+        out.starts_with("% mathfmt declarations: <stdin>, profile ascii"),
+        "{out}"
+    );
 }

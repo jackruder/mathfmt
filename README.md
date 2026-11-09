@@ -83,9 +83,10 @@ back empty; a pre-commit hook passes the files itself.
 
 ### A whole paper at once
 
-A paper is a root file, the files it reads with `\input` and `\include`, and a
-preamble that loads packages, some of them local. Name the root and mathfmt
-reads that much itself, without running TeX:
+A paper is a root file, the files it reads with `\input`, `\include`,
+`\subfile` and `\import`, and a preamble that loads packages, some of them
+local. Name the root and mathfmt reads that much itself, without running
+TeX:
 
 ```sh
 mathfmt project main.tex            # what it found: files, packages, engine
@@ -107,12 +108,16 @@ inputs, in reading order. A package is read and never rewritten. The reader
 does not evaluate conditionals, skips a file name built by a macro, and knows
 a distributed package by its name only.
 
-The preamble also says what the document is written for. One that loads
-`unicode-math` is compiled with lualatex by `--verify`, and a profile's
-commands for the math alphabets become unicode-math's (`\symbf`, `\symbb`,
-`\symcal`) instead of `\mathbf`, `\mathbb`, `\mathcal`, which that package
-typesets differently; `style_preset = "latex"` or `"unicode-math"` in a
-profile decides it by hand, `engine = "…"` in the config names the program.
+The preamble also says what the document is written for. A document whose
+preamble loads `unicode-math`, named alone or as a root, is compiled with
+lualatex by `--verify`, and a profile's commands for the math alphabets
+become unicode-math's (`\symbf`, `\symbb`, `\symcal`) instead of `\mathbf`,
+`\mathbb`, `\mathcal`, which that package typesets differently; a symbol
+whose amssymb name that package lacks (`\square`) is written by its
+unicode-math name (`\mdlgwhtsquare`). `style_preset = "latex"` or
+`"unicode-math"` in a profile decides it by hand; `--engine` or `engine` in
+the config names the program, and the commands, the declarations and
+`--verify` all follow it.
 
 `mathfmt declarations` prints what the preamble must hold for the notation to
 compile in either form: the packages the profile's commands come from that
@@ -136,7 +141,7 @@ config):
 
 | | |
 |---|---|
-| `unicode-math-input` | pdflatex with that package. It knows every symbol, and reads a character after `\big` or as a script. Only styled letters are declared, where it follows pdflatex's limits. The default under pdflatex. |
+| `unicode-math-input` | pdflatex with that package, which reads a character after `\big` or as a script where the kernel's mechanism does not. Every character is declared all the same: the package's own table lacks some symbols and reads others as something else (`√` as the radical). The default under pdflatex. |
 | `kernel` | pdflatex with `\DeclareUnicodeCharacter` and no package. Every character is declared, inside `\ensuremath`, so it also works in text. `\big⟨` does not compile. |
 | `unicode-math` | lualatex or xelatex with unicode-math. The characters are native; nothing is declared. |
 
@@ -303,6 +308,10 @@ configurable:
   `\Im` from cmsy, and they look different. Set `spellings."frak:I" =
   "\\mathfrak{I}"` (and `frak:R`) for a paper that means the letter.
 
+- **∅ and ⌀.** `\emptyset` (pdflatex's slashed zero) and `\varnothing`
+  (amssymb's slashed circle) are one codepoint, U+2205, whose glyph is the
+  circle. The `ascii` profile spells it `\varnothing`; set
+  `spellings."∅" = "\\emptyset"` for a paper that means the zero.
 - **Shape under unicode-math.** With that package's default options the
   shape of a bold or sans letter is the document's (`bold-style`,
   `sans-style`), not the character's: a literal `𝛔`, a literal `𝝈` and

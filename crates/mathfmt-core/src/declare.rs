@@ -18,9 +18,11 @@ use crate::lex::{lex_all, TokKind};
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mechanism {
-    /// pdflatex with the `unicode-math-input` package, which knows every
-    /// symbol and reads a character after `\big` or as a script; only the
-    /// styled letters, where it follows pdflatex's limits, are declared.
+    /// pdflatex with the `unicode-math-input` package, which reads a
+    /// character after `\big` or as a script where the kernel's mechanism
+    /// does not. Every character is declared all the same: the package's
+    /// own table lacks some symbols (↝, ⊳) and reads others as something
+    /// else (√ as the radical, ∖ as a set difference of another shape).
     UnicodeMathInput,
     /// pdflatex with the kernel's `\DeclareUnicodeCharacter` and nothing
     /// else: every character is declared, inside `\ensuremath`, so it also
@@ -92,7 +94,7 @@ impl Declarations {
                 Mechanism::Kernel => {
                     "% Unicode math input: each character means what the profile spells it as\n"
                 }
-                _ => "% styled letters, as the profile spells them (unicode-math-input follows pdflatex, which has no bold Greek under \\mathbf and no blackboard digits)\n",
+                _ => "% Unicode math input: each character means what the profile spells it as (unicode-math-input's own table lacks some and reads others differently)\n",
             });
             for d in &self.chars {
                 match self.mechanism {

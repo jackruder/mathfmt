@@ -173,6 +173,9 @@ pub fn check_pattern(pattern: &str) -> Result<usize, String> {
 pub struct Binding<'n> {
     pub span: Span,
     pub nodes: &'n [Node],
+    /// The binding is one braced group that was a script's operand: its
+    /// braces belong to the script, not to what is inside.
+    pub operand_group: bool,
 }
 
 /// A form matched in the document.
@@ -438,6 +441,11 @@ impl<'a> Matcher<'a> {
                 let end = i + 1;
                 let saved: Vec<bool> = binds.iter().map(Option::is_some).collect();
                 if self.bind(h, &d[..end], binds) {
+                    if after_script && i == 0 && matches!(node, Node::Group(_)) {
+                        if let Some(b) = binds.get_mut(h).and_then(Option::as_mut) {
+                            b.operand_group = true;
+                        }
+                    }
                     if let Some(used) = self.match_seq(
                         rest_pat,
                         pat_src,
@@ -486,7 +494,11 @@ impl<'a> Matcher<'a> {
                 existing.span.text(self.doc_src).trim() == span.text(self.doc_src).trim()
             }
             None => {
-                binds[h] = Some(Binding { span, nodes: run });
+                binds[h] = Some(Binding {
+                    span,
+                    nodes: run,
+                    operand_group: false,
+                });
                 true
             }
         }
@@ -510,6 +522,7 @@ impl<'a> Matcher<'a> {
                 binds[h] = Some(Binding {
                     span,
                     nodes: &g.children,
+                    operand_group: false,
                 });
                 true
             }
@@ -671,15 +684,20 @@ pub fn rewrite(
                 let Some(hole) = n.checked_sub(1).and_then(|i| m.holes.get(i)) else {
                     continue;
                 };
-                let mut text = apply_within(src, hole.span, &edits);
-                // Where the form supplies the grouping (`{#1}`, or a script
-                // whose operand is braced below), the binding's own braces
-                // would be a second pair: `_{x}` into `\E{#1}` is `\E{x}`.
+                // The hole's edits were planned in the source's context,
+                // where a leading or trailing space may have kept a control
+                // word apart from a letter; the seams here are the form's.
+                let mut text = apply_within(src, hole.span, &edits).trim().to_string();
+                // A binding that was a script's braced operand brings braces
+                // that belonged to the script. Where the form supplies the
+                // grouping (`{#1}`, or a script whose operand is braced
+                // below), they would be a second pair: `_{x}` into `\E{#1}`
+                // is `\E{x}`. A group that stood alone keeps them: `{-x}`.
                 let script = crate::print::is_script_operand(&out);
                 let real = |j: Option<usize>| j.and_then(|j| all.get(j)).map(|t| t.kind);
                 let enclosed = real(prev_real(&all, i)) == Some(TokKind::Open)
                     && real(next_real(&all, i)) == Some(TokKind::Close);
-                if script || enclosed {
+                if hole.operand_group && (script || enclosed) {
                     if let Some(inner) = crate::print::one_group_contents(&text) {
                         text = inner.trim().to_string();
                     }

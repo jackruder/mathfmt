@@ -32,6 +32,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
 
+use mathfmt_core::project::{code_part, is_document};
 use mathfmt_core::{Engine, Mechanism, Profile, Project};
 
 /// Left in a build directory mathfmt made, so that a later run with the
@@ -59,9 +60,11 @@ pub struct Source<'a> {
     pub profile: &'a Profile,
     /// The program to compile with: `pdflatex`, `lualatex`, `xelatex`, …
     pub program: String,
-    /// In project mode, the root this file was taken from: a document is
-    /// compiled with the files of its own project only.
+    /// In project mode, the root this file was taken from.
     pub project: Option<usize>,
+    /// Named by the caller as a thing to verify: every FILE, or a project's
+    /// root. A file that only came along as part of a project is not.
+    pub is_root: bool,
     /// Preamble lines to add before `\begin{document}` on both sides.
     pub declare: Option<&'a str>,
 }
@@ -209,27 +212,6 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-/// The part of a line before its comment, if it has one.
-fn code_part(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 1,
-            b'%' => return &line[..i],
-            _ => {}
-        }
-        i += 1;
-    }
-    line
-}
-
-/// Does this source carry its own `\documentclass` (outside comments)?
-pub fn is_document(text: &str) -> bool {
-    text.lines()
-        .any(|l| code_part(l).contains("\\documentclass"))
-}
-
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -254,20 +236,25 @@ pub fn run(sources: &[Source<'_>], opts: &Options) -> Result<Vec<Report>> {
     let mut read_by_a_document: BTreeSet<PathBuf> = BTreeSet::new();
     for s in sources.iter().filter(|s| is_document(s.original)) {
         if let Ok(project) = Project::read(&s.path) {
+            let own = canonical(&s.path);
             read_by_a_document.extend(
                 project
                     .files
                     .iter()
                     .chain(&project.definitions)
-                    .map(|f| canonical(f)),
+                    .map(|f| canonical(f))
+                    .filter(|f| *f != own),
             );
         }
     }
+    // A root: a document, or a file named for verification, unless a
+    // document among the sources reads it (a subfile, a section): that one
+    // is verified as part of its document.
     let roots: Vec<usize> = (0..sources.len())
         .filter(|&i| {
             let s = &sources[i];
-            is_document(s.original)
-                || (s.project.is_none() && !read_by_a_document.contains(&canonical(&s.path)))
+            (is_document(s.original) || s.is_root)
+                && !read_by_a_document.contains(&canonical(&s.path))
         })
         .collect();
     let base = match &opts.keep {
@@ -371,32 +358,63 @@ fn check_tool(name: &str) -> Result<()> {
     }
 }
 
-/// Put `block` before the first `\begin{document}` that is not in a
-/// comment; `None` when the text has none.
-fn inject(text: &str, block: &str) -> Option<String> {
+/// The byte offset of the `\begin{document}` TeX will act on: outside a
+/// comment (`\\%` starts one, `\%` does not) and outside a verbatim
+/// environment, `\begin {document}` with a space included.
+fn begin_document(text: &str) -> Option<usize> {
     let mut offset = 0;
+    let mut verbatim: Option<String> = None;
     for line in text.split_inclusive('\n') {
-        if let Some(at) = line.find("\\begin{document}") {
-            let before = &line.as_bytes()[..at];
-            let commented = before
-                .iter()
-                .enumerate()
-                .any(|(i, &b)| b == b'%' && (i == 0 || before[i - 1] != b'\\'));
-            if !commented {
-                let at = offset + at;
-                let mut out = String::with_capacity(text.len() + block.len() + 1);
-                out.push_str(&text[..at]);
-                out.push_str(block);
-                if !block.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str(&text[at..]);
-                return Some(out);
+        let code = code_part(line);
+        if let Some(env) = &verbatim {
+            if code.contains(&format!("\\end{{{env}}}")) {
+                verbatim = None;
             }
+            offset += line.len();
+            continue;
+        }
+        let mut from = 0;
+        while let Some(at) = code[from..].find("\\begin") {
+            let at = from + at;
+            let rest = code[at + 6..].trim_start();
+            if let Some(env) = rest.strip_prefix('{').and_then(|r| r.split('}').next()) {
+                if env == "document" {
+                    return Some(offset + at);
+                }
+                if matches!(
+                    env,
+                    "verbatim"
+                        | "verbatim*"
+                        | "Verbatim"
+                        | "lstlisting"
+                        | "minted"
+                        | "comment"
+                        | "filecontents"
+                        | "filecontents*"
+                ) {
+                    verbatim = Some(env.to_string());
+                    break;
+                }
+            }
+            from = at + 6;
         }
         offset += line.len();
     }
     None
+}
+
+/// Put `block` before the document's `\begin{document}`; `None` when the
+/// text has none.
+fn inject(text: &str, block: &str) -> Option<String> {
+    let at = begin_document(text)?;
+    let mut out = String::with_capacity(text.len() + block.len() + 1);
+    out.push_str(&text[..at]);
+    out.push_str(block);
+    if !block.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&text[at..]);
+    Some(out)
 }
 
 /// The verdict for one root, and how many preamble lines were added.
@@ -416,16 +434,32 @@ fn verify_root(
     let root_dir = std::fs::canonicalize(&root_dir)
         .with_context(|| format!("resolving {}", root_dir.display()))?;
     // A document is compiled from a copy of its directory holding the
-    // sources that live there (in project mode, those of its own project).
-    // A source elsewhere is another document's, unless this one reads it:
-    // then the copy cannot hold it, and saying so beats comparing the
-    // original with itself.
+    // sources that live there: its own project's, and any other source it
+    // reads (a file two roots share is converted once, by the first, and
+    // must still be the converted copy here). A source elsewhere is another
+    // document's, unless this one reads it: then the copy cannot hold it,
+    // and saying so beats comparing the original with itself.
     let mut parts: Vec<(&Source<'_>, PathBuf)> = Vec::new();
+    let mut reads: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut include_dirs: Vec<PathBuf> = Vec::new();
     if document {
-        let reads: BTreeSet<PathBuf> = Project::read(&root.path)
-            .map(|p| p.files.iter().map(|f| canonical(f)).collect())
-            .unwrap_or_default();
-        for s in all.iter().filter(|s| s.project == root.project) {
+        if let Ok(project) = Project::read(&root.path) {
+            reads = project.files.iter().map(|f| canonical(f)).collect();
+            // `\include{sections/x}` writes `sections/x.aux` under the
+            // output directory, which TeX does not create; every file the
+            // document reads gets its directory there.
+            for f in &project.files {
+                if let Ok(rel) = relative_to(&root_dir, f) {
+                    if let Some(p) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        include_dirs.push(p.to_path_buf());
+                    }
+                }
+            }
+        }
+        for s in all
+            .iter()
+            .filter(|s| s.project == root.project || reads.contains(&canonical(&s.path)))
+        {
             match relative_to(&root_dir, &s.path) {
                 Ok(rel) => parts.push((s, rel)),
                 Err(_) if s.original != s.converted && reads.contains(&canonical(&s.path)) => {
@@ -447,6 +481,12 @@ fn verify_root(
     let declare = root
         .declare
         .filter(|block| document && !block.trim().is_empty());
+    if declare.is_some() && begin_document(root.original).is_none() {
+        bail!(
+            "{}: the declarations cannot be added: no \\begin{{document}} outside a comment or a verbatim environment",
+            root.path.display()
+        );
+    }
     let declared = declare.map_or(0, |block| {
         block
             .lines()
@@ -470,6 +510,9 @@ fn verify_root(
         let out_dir = dir.join(side).join("out");
         std::fs::create_dir_all(&src_dir)?;
         std::fs::create_dir_all(&out_dir)?;
+        for d in &include_dirs {
+            std::fs::create_dir_all(out_dir.join(d))?;
+        }
         let job_name = if document {
             for (s, rel) in &parts {
                 let text = if converted { s.converted } else { s.original };
@@ -482,8 +525,6 @@ fn verify_root(
                 if let Some(p) = target.parent() {
                     std::fs::create_dir_all(p)?;
                 }
-                // `\include{sections/x}` writes `sections/x.aux` under the
-                // output directory, which TeX does not create.
                 if let Some(p) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(out_dir.join(p))?;
                 }
@@ -591,6 +632,14 @@ fn compile(
     if let Some(config_dir) = &config.dir {
         dirs.push(config_dir.clone());
     }
+    if let Some(project) = &root.engine.project {
+        dirs.push(canonical(&project.dir));
+        for d in &project.definitions {
+            if let Some(parent) = canonical(d).parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
     let config_macros = config.macros.iter().map(|m| match &config.dir {
         Some(d) => d.join(m),
         None => PathBuf::from(m),
@@ -665,17 +714,22 @@ fn wrap_snippet(root: &Source<'_>, text: &str, opts: &Options) -> Result<String>
             body.push('\n');
         }
     }
-    // The definitions mathfmt was told about are what the snippet assumes.
+    // The definitions mathfmt was told about are what the snippet assumes:
+    // the project's local packages and preamble inputs, the config's macro
+    // files, the command line's.
     let config_dir = root.engine.config.dir.clone();
-    let macro_files = root
+    let project_files: Vec<PathBuf> = root
         .engine
-        .config
-        .macros
-        .iter()
-        .map(|m| match &config_dir {
+        .project
+        .as_ref()
+        .map(|p| p.definitions.clone())
+        .unwrap_or_default();
+    let macro_files = project_files
+        .into_iter()
+        .chain(root.engine.config.macros.iter().map(|m| match &config_dir {
             Some(d) => d.join(m),
             None => PathBuf::from(m),
-        })
+        }))
         .chain(opts.macros.iter().cloned());
     for m in macro_files {
         let abs = std::fs::canonicalize(&m).unwrap_or(m.clone());
@@ -904,7 +958,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn declarations_go_before_the_first_live_begin_document() {
+    fn declarations_go_before_the_live_begin_document() {
         let text = "\\documentclass{article}\n% \\begin{document}\n\\title{50\\% off}\\begin{document}\nx\n\\begin{document}\n";
         let out = inject(text, "\\usepackage{bbm}").unwrap();
         assert_eq!(
@@ -912,6 +966,13 @@ mod tests {
             "\\documentclass{article}\n% \\begin{document}\n\\title{50\\% off}\\usepackage{bbm}\n\\begin{document}\nx\n\\begin{document}\n"
         );
         assert!(inject("no document here\n% \\begin{document}\n", "x").is_none());
+        // `\\%` is a line break and then a comment; a space before the brace;
+        // a `\begin{document}` inside filecontents is text.
+        let tricky = "\\newcommand{\\two}{a\\\\% the \\begin{document} is below\nb}\n\\begin{filecontents*}{x.tex}\n\\begin{document}\n\\end{filecontents*}\n\\begin {document}\n";
+        assert_eq!(
+            begin_document(tricky),
+            Some(tricky.rfind("\\begin {document}").unwrap())
+        );
     }
 
     #[test]

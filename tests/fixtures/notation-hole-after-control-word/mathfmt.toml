@@ -1,0 +1,5 @@
+[notations.ip]
+angle = "\\langle #1, #2 \\rangle"
+bk    = "\\bk{#1}{#2}"
+[profiles.unicode.notations]
+ip = "angle"

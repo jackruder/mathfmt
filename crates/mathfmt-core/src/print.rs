@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use crate::atom::{Atom, Style};
-use crate::config::{Form, Profile};
+use crate::config::{Form, Profile, StylePreset};
 use crate::diag::Diagnostic;
-use crate::lex::Span;
+use crate::lex::{Span, TokKind};
 use crate::resolve::{Occurrence, Part};
 use crate::table::Table;
 
@@ -322,6 +322,22 @@ fn spell_one(atom: &Atom, profile: &Profile, table: &Table) -> Result<Piece, Ato
     if let Some(s) = table.latex_of(atom).filter(|s| !s.starts_with('\\')) {
         return Ok(Piece::Plain(s.to_string()));
     }
+    // The curated command spelling, where the document's package family
+    // defines it. unicode-math replaces amssymb and lacks a few of its
+    // names (`\square`, `\leadsto`); there its own name for the character
+    // (`\mdlgwhtsquare`) is the spelling that exists.
+    let command_spelling = |atom: &Atom| -> Option<String> {
+        let curated = table.latex_of(atom)?;
+        let exists = profile.preset != StylePreset::UnicodeMath
+            || crate::declare::control_words(curated)
+                .iter()
+                .all(|w| table.in_unicode_math(w));
+        if exists {
+            Some(curated.to_string())
+        } else {
+            table.unicode_math_name(atom).map(|n| format!("\\{n}"))
+        }
+    };
     match atom {
         Atom::Named(c) => {
             let form = if table.is_greek_letter(atom) {
@@ -331,10 +347,7 @@ fn spell_one(atom: &Atom, profile: &Profile, table: &Table) -> Result<Piece, Ato
             };
             match form {
                 Form::Unicode => Ok(Piece::Plain(c.to_string())),
-                Form::Latex => table
-                    .latex_of(atom)
-                    .map(|s| Piece::Plain(s.to_string()))
-                    .ok_or(*atom),
+                Form::Latex => command_spelling(atom).map(Piece::Plain).ok_or(*atom),
             }
         }
         Atom::Styled { base, style } => {
@@ -342,12 +355,13 @@ fn spell_one(atom: &Atom, profile: &Profile, table: &Table) -> Result<Piece, Ato
                 if let Some(c) = table.char_of(atom) {
                     return Ok(Piece::Plain(c.to_string()));
                 }
-            } else if let Some(s) = table.latex_of(atom) {
-                return Ok(Piece::Plain(s.to_string()));
+            } else if let Some(s) = command_spelling(atom) {
+                return Ok(Piece::Plain(s));
             }
             let key = match (style, base) {
                 (Style::Bf, b) if !b.is_ascii() => "bf_greek",
                 (Style::Bb, b) if b.is_ascii_digit() => "bb_digit",
+                (Style::Bb, b) if b.is_ascii_lowercase() => "bb_lower",
                 (s, _) => s.as_str(),
             };
             let command = profile.style_commands.get(key).ok_or(*atom)?.clone();
@@ -395,11 +409,31 @@ fn starts_alphabetic(s: &str) -> bool {
     s.chars().next().is_some_and(char::is_alphabetic)
 }
 
-/// Is the text before an occurrence a `^` or `_` (spaces allowed), so the
-/// occurrence is the operand of a script?
+/// Is the last thing before an occurrence a script operator (`^`, `_`,
+/// `\sp`, `\sb`), with any whitespace, newlines and comments between, so
+/// the occurrence is the operand of a script? The lines before are lexed
+/// from their start, since only that tells a comment from code.
 pub(crate) fn is_script_operand(before: &str) -> bool {
-    let trimmed = before.trim_end_matches([' ', '\t']);
-    trimmed.ends_with('^') || trimmed.ends_with('_')
+    let mut end = before.trim_end().len();
+    loop {
+        let start = before[..end].rfind('\n').map_or(0, |i| i + 1);
+        let line = &before[start..end];
+        if let Some(t) = crate::lex::lex_all(line)
+            .into_iter()
+            .rev()
+            .find(|t| t.kind != TokKind::Trivia)
+        {
+            return match t.kind {
+                TokKind::Sup | TokKind::Sub => true,
+                TokKind::ControlWord => matches!(t.name(line), "sp" | "sb"),
+                _ => false,
+            };
+        }
+        if start == 0 {
+            return false;
+        }
+        end = before[..start].trim_end().len();
+    }
 }
 
 /// A script operand that is a multi-byte character (pdflatex reads it a byte
@@ -447,9 +481,22 @@ fn is_one_unit(text: &str) -> bool {
     one_group_contents(rest).is_some() && !rest.starts_with(char::is_whitespace)
 }
 
-/// Does a `^`, `_` or prime come next, spaces aside?
+/// Does a script operator or a prime come next, trivia aside: `^`, `_`,
+/// `\sp`, `\sb`, `'`, or a prime character?
 fn followed_by_script(after: &str) -> bool {
-    after.trim_start().starts_with(['^', '_', '\''])
+    let mut pos = 0;
+    while let Some(t) = crate::lex::lex_one(after, pos) {
+        match t.kind {
+            TokKind::Trivia => pos = t.span.end,
+            TokKind::Sup | TokKind::Sub => return true,
+            TokKind::ControlWord => return matches!(t.name(after), "sp" | "sb"),
+            TokKind::Char => {
+                return matches!(t.ch(after), '\'' | '′' | '″' | '‴' | '⁗');
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -544,6 +591,32 @@ mod tests {
         for (out, profile) in [(&u, "unicode"), (&a, "ascii")] {
             assert_eq!(&convert(out, profile).0, out, "stable under {profile}");
         }
+    }
+
+    #[test]
+    fn a_script_is_seen_through_sp_sb_comments_newlines_and_primes() {
+        let (u, _) = convert(
+            "$\\mathbf{x^2}\\sp3 + \\mathbf{x_1}\\sb2 + \\mathbf{x^2}′ + \\mathbf{x^2}% c\n^3 + \\mathbf{x^2}\n'$",
+            "unicode",
+        );
+        assert_eq!(
+            u,
+            "${𝐱^{𝟐}}\\sp3 + {𝐱_{𝟏}}\\sb2 + {𝐱^{𝟐}}′ + {𝐱^{𝟐}}% c\n^3 + {𝐱^{𝟐}}\n'$"
+        );
+        assert!(is_script_operand("x^"));
+        assert!(is_script_operand("x_ "));
+        assert!(is_script_operand("x^% a comment\n"));
+        assert!(is_script_operand("x^% a\n% b\n  "));
+        assert!(is_script_operand("x\\sp"));
+        assert!(is_script_operand("x\\sb "));
+        assert!(!is_script_operand("x\\sum "));
+        assert!(!is_script_operand("x^y "));
+        assert!(!is_script_operand("% x^\n"));
+        assert!(followed_by_script("\\sp3"));
+        assert!(followed_by_script("% c\n^3"));
+        assert!(followed_by_script(" ′"));
+        assert!(!followed_by_script(" + 1"));
+        assert!(!followed_by_script("\\prime"));
     }
 
     #[test]

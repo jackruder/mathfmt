@@ -10,7 +10,9 @@
 //! The reader is a token walk, not an interpreter: a conditional is not
 //! evaluated (`\iffalse\input{x}\fi` still names `x`), a file name built by a
 //! macro is skipped, and a package that TeX Live supplies is known by name
-//! only.
+//! only. Names resolve as TeX's do: `name.tex` before `name`, against the
+//! root's directory, or against the import path inside a file that
+//! `\import` or `\subimport` brought in.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -56,7 +58,8 @@ pub struct Project {
     /// the order TeX reads them, each once.
     pub files: Vec<PathBuf>,
     /// Names the body inputs that no file beside the root answers
-    /// (generated files, files TeX finds elsewhere).
+    /// (generated files, files TeX finds elsewhere), and files that could
+    /// not be read, each with the reason in parentheses.
     pub missing: Vec<String>,
     /// The document class.
     pub class: Option<String>,
@@ -73,7 +76,7 @@ pub struct Project {
 impl Project {
     /// Read a root document and everything it pulls in.
     pub fn read(root: &Path) -> std::io::Result<Project> {
-        let text = std::fs::read_to_string(root)?;
+        let text = read_text(root)?;
         let dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
         let mut project = Project {
             root: root.to_path_buf(),
@@ -87,7 +90,15 @@ impl Project {
         };
         reader.mark(root);
         reader.project.files.push(root.to_path_buf());
-        reader.read(root, &text, Mode::Root, 0);
+        // A root with no `\documentclass` is a snippet: all of it is body,
+        // and what it inputs are files to convert, not definitions.
+        let mode = if is_document(&text) {
+            Mode::Root
+        } else {
+            Mode::Body
+        };
+        let base = reader.project.dir.clone();
+        reader.read(&text, mode, 0, &base);
         Ok(project)
     }
 
@@ -123,6 +134,72 @@ impl Project {
         }
     }
 }
+
+/// A file's text, without a byte-order mark.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => text,
+    })
+}
+
+/// The part of a line before its comment: a `%` after an even number of
+/// backslashes (none, or `\\`) starts one.
+pub fn code_part(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'%' => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Does this source carry its own `\documentclass`, outside comments and
+/// outside the verbatim environments that could show one?
+pub fn is_document(text: &str) -> bool {
+    let mut verbatim: Option<String> = None;
+    for line in text.lines() {
+        let code = code_part(line);
+        if let Some(env) = &verbatim {
+            if code.contains(&format!("\\end{{{env}}}")) {
+                verbatim = None;
+            }
+            continue;
+        }
+        if let Some(at) = code.find("\\begin{") {
+            let rest = &code[at + 7..];
+            if let Some(end) = rest.find('}') {
+                let env = &rest[..end];
+                if VERBATIM_ENVIRONMENTS.contains(&env) {
+                    verbatim = Some(env.to_string());
+                    continue;
+                }
+            }
+        }
+        if code.contains("\\documentclass") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Environments whose body TeX does not read as code.
+const VERBATIM_ENVIRONMENTS: &[&str] = &[
+    "verbatim",
+    "verbatim*",
+    "Verbatim",
+    "lstlisting",
+    "minted",
+    "comment",
+    "filecontents",
+    "filecontents*",
+];
 
 /// `% !TEX program = lualatex` (or `TS-program`) in the first lines.
 fn magic_program(text: &str) -> Option<String> {
@@ -171,13 +248,21 @@ impl Reader<'_> {
         self.seen.insert(key)
     }
 
-    fn read(&mut self, path: &Path, text: &str, mode: Mode, depth: usize) {
+    /// Read one file. `base` is where its `\input` names resolve: the
+    /// root's directory, or the import path of the `\import` that brought
+    /// the file in.
+    fn read(&mut self, text: &str, mode: Mode, depth: usize, base: &Path) {
         let tokens = lex_all(text);
         let mut preamble = mode != Mode::Body;
+        let mut ending = false;
         let mut i = 0;
         while i < tokens.len() {
             let t = tokens[i];
             i += 1;
+            // `\endinput` takes effect at the end of its line.
+            if ending && t.kind == TokKind::Trivia && t.text(text).contains('\n') {
+                return;
+            }
             if t.kind != TokKind::ControlWord {
                 continue;
             }
@@ -193,7 +278,7 @@ impl Reader<'_> {
                         } else {
                             self.package(name);
                         }
-                        self.local(name, "cls", depth);
+                        self.local(name, "cls", depth, base);
                     }
                 }
                 "usepackage" | "RequirePackage" | "RequirePackageWithOptions" if preamble => {
@@ -203,16 +288,15 @@ impl Reader<'_> {
                     i = next;
                     for name in list(&names) {
                         self.package(name);
-                        self.local(name, "sty", depth);
+                        self.local(name, "sty", depth, base);
                     }
                 }
-                name @ ("input" | "include" | "subfile" | "InputIfFileExists") => {
+                "input" | "include" | "subfile" | "InputIfFileExists" => {
                     let Some((file, next)) = file_name(&tokens, i, text) else {
                         continue;
                     };
                     i = next;
-                    let dir = self.project.dir.clone();
-                    self.input(&dir, &file, name == "include", preamble, depth);
+                    self.input(base, &file, preamble, depth);
                 }
                 name @ ("import" | "subimport") => {
                     let Some((sub, next)) = braced(&tokens, i, text, false) else {
@@ -225,12 +309,15 @@ impl Reader<'_> {
                     if !plain_name(&sub) {
                         continue;
                     }
-                    let base = if name == "subimport" {
-                        path.parent().map(Path::to_path_buf).unwrap_or_default()
+                    // The import path: from the root for `\import`, from the
+                    // current one for `\subimport`; the file read there
+                    // resolves its own inputs against it.
+                    let import_base = if name == "subimport" {
+                        base.join(sub.trim())
                     } else {
-                        self.project.dir.clone()
+                        self.project.dir.join(sub.trim())
                     };
-                    self.input(&base.join(sub.trim()), &file, false, preamble, depth);
+                    self.input(&import_base, &file, preamble, depth);
                 }
                 "begin" | "end" if mode == Mode::Root => {
                     let begin = t.name(text) == "begin";
@@ -245,7 +332,7 @@ impl Reader<'_> {
                         }
                     }
                 }
-                "endinput" => return,
+                "endinput" => ending = true,
                 _ => {}
             }
         }
@@ -259,64 +346,76 @@ impl Reader<'_> {
 
     /// A package or class that is a file beside the root is read for what
     /// it loads and defines.
-    fn local(&mut self, name: &str, extension: &str, depth: usize) {
+    fn local(&mut self, name: &str, extension: &str, depth: usize, base: &Path) {
         if !plain_name(name) {
             return;
         }
         let path = self.project.dir.join(format!("{name}.{extension}"));
-        self.definitions(&path, depth);
+        self.definitions(&path, depth, base);
     }
 
-    fn definitions(&mut self, path: &Path, depth: usize) {
-        if depth >= MAX_DEPTH || !path.is_file() || !self.mark(path) {
+    fn definitions(&mut self, path: &Path, depth: usize, base: &Path) {
+        if !path.is_file() || !self.mark(path) {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(path) else {
+        if depth >= MAX_DEPTH {
+            self.project.missing.push(format!(
+                "{} (nested deeper than {MAX_DEPTH})",
+                path.display()
+            ));
+            return;
+        }
+        let Ok(text) = read_text(path) else {
+            self.project
+                .missing
+                .push(format!("{} (not UTF-8)", path.display()));
             return;
         };
         self.project.definitions.push(path.to_path_buf());
-        self.read(path, &text, Mode::Preamble, depth + 1);
+        self.read(&text, Mode::Preamble, depth + 1, base);
     }
 
-    /// `\input{file}` seen in `base`: a definition file from the preamble, a
-    /// file to convert from the body.
-    fn input(&mut self, base: &Path, file: &str, include: bool, preamble: bool, depth: usize) {
+    /// `\input{file}` resolving against `base`: a definition file from the
+    /// preamble (or a package or class wherever it is named), a file to
+    /// convert from the body. TeX tries `file.tex` before `file`, for
+    /// `\include` too.
+    fn input(&mut self, base: &Path, file: &str, preamble: bool, depth: usize) {
         let file = file.trim();
         if !plain_name(file) {
             return;
         }
-        let named = base.join(file);
         let with_tex = base.join(format!("{file}.tex"));
-        let has_extension = Path::new(file).extension().is_some();
-        let path = if include || !has_extension {
-            if with_tex.is_file() || include {
-                with_tex
-            } else {
-                named
-            }
+        let named = base.join(file);
+        let path = if with_tex.is_file() {
+            with_tex
         } else if named.is_file() {
             named
         } else {
-            with_tex
-        };
-        if !path.is_file() {
             if !preamble && !self.project.missing.iter().any(|m| m == file) {
                 self.project.missing.push(file.to_string());
             }
             return;
-        }
-        if preamble {
-            self.definitions(&path, depth);
+        };
+        let is_package = path.extension().is_some_and(|e| e == "sty" || e == "cls");
+        if preamble || is_package {
+            self.definitions(&path, depth, base);
             return;
         }
-        if depth >= MAX_DEPTH || !self.mark(&path) {
+        if !self.mark(&path) {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        if depth >= MAX_DEPTH {
+            self.project
+                .missing
+                .push(format!("{file} (nested deeper than {MAX_DEPTH})"));
+            return;
+        }
+        let Ok(text) = read_text(&path) else {
+            self.project.missing.push(format!("{file} (not UTF-8)"));
             return;
         };
         self.project.files.push(path.clone());
-        self.read(&path, &text, Mode::Body, depth + 1);
+        self.read(&text, Mode::Body, depth + 1, base);
     }
 }
 
@@ -480,6 +579,109 @@ mod tests {
         assert!(p.loads("bm") && !p.loads("bbm") && !p.loads("never"));
         assert_eq!(p.engine(), "pdflatex");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_resolve_as_tex_resolves_them() {
+        let dir = tree(
+            "resolve",
+            &[
+                (
+                    "main.tex",
+                    "\u{feff}% !TEX program = lualatex\n\\documentclass{article}\n\\begin{document}\n\
+                     \\import{parts/}{p}\\input{plain}\\input{a.b}\\include{chap.tex}\n\
+                     \\input{defs.sty}\\input{latin1}\n\\endinput \\input{tail}\n\
+                     \\input{never}\n\\end{document}\n",
+                ),
+                ("parts/p.tex", "\\input{q} \\subimport{sub/}{r}"),
+                ("parts/q.tex", "q"),
+                ("q.tex", "wrong q"),
+                ("parts/sub/r.tex", "r"),
+                ("plain.tex", "\\subimport{x/}{y}"),
+                ("x/y.tex", "y"),
+                ("a.b", "wrong"),
+                ("a.b.tex", "right"),
+                ("chap.tex", "chapter"),
+                ("defs.sty", "\\newcommand{\\R}{\\mathbb{R}}"),
+                ("tail.tex", "tail"),
+                ("never.tex", "never"),
+            ],
+        );
+        std::fs::write(dir.join("latin1.tex"), b"caf\xe9").unwrap();
+        let p = Project::read(&dir.join("main.tex")).unwrap();
+        assert_eq!(
+            names(&dir, &p.files),
+            [
+                "main.tex",
+                "parts/p.tex",
+                "parts/q.tex",
+                "parts/sub/r.tex",
+                "plain.tex",
+                "x/y.tex",
+                "a.b.tex",
+                "chap.tex",
+                "tail.tex"
+            ],
+            "the import path, `.tex` first, \\include of a name with an extension, and the rest of \\endinput's line"
+        );
+        assert_eq!(
+            names(&dir, &p.definitions),
+            ["defs.sty"],
+            "a .sty the body inputs is a package"
+        );
+        assert_eq!(p.missing, ["latin1 (not UTF-8)"]);
+        assert_eq!(
+            p.program.as_deref(),
+            Some("lualatex"),
+            "past the byte-order mark"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_root_without_a_class_is_a_snippet_and_depth_is_bounded() {
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "snippet.tex".into(),
+                "Text $x$ \\input{part} \\usepackage{never}".into(),
+            ),
+            ("part.tex".into(), "$y$ \\input{c0}".into()),
+        ];
+        for i in 0..40 {
+            files.push((format!("c{i}.tex"), format!("\\input{{c{}}}", i + 1)));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let dir = tree("snippet", &refs);
+        let p = Project::read(&dir.join("snippet.tex")).unwrap();
+        assert_eq!(
+            names(&dir, &p.files)[..3],
+            ["snippet.tex", "part.tex", "c0.tex"]
+        );
+        assert!(p.packages.is_empty(), "a snippet has no preamble");
+        assert_eq!(p.files.len(), MAX_DEPTH + 1, "{} files", p.files.len());
+        assert!(
+            p.missing.iter().any(|m| m.contains("nested deeper than")),
+            "{:?}",
+            p.missing
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn documents_are_told_outside_comments_and_verbatim() {
+        assert!(is_document("\\documentclass{article}\n"));
+        assert!(!is_document("$x$ % not a \\documentclass\n"));
+        assert!(!is_document(
+            "\\begin{verbatim}\n\\documentclass{article}\n\\end{verbatim}\n$x$\n"
+        ));
+        assert!(is_document(
+            "\\begin{verbatim}\nx\n\\end{verbatim}\n\\documentclass{article}\n"
+        ));
+        assert_eq!(code_part("a \\% b % c"), "a \\% b ");
+        assert_eq!(code_part("a\\\\% c"), "a\\\\", "\\\\ then a comment");
     }
 
     #[test]

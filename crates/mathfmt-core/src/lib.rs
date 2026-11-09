@@ -185,10 +185,12 @@ impl Engine {
 
     /// The profile to use: `name`, else the config's default. A profile
     /// that does not choose a `style_preset` gets unicode-math's commands
-    /// when the project's preamble loads that package.
+    /// when the document reads Unicode through unicode-math (the preamble
+    /// loads it, or the engine is not pdflatex): the same rule the
+    /// declarations follow, so the two never disagree.
     pub fn profile(&self, name: Option<&str>) -> Result<Profile, Error> {
-        let preset = match &self.project {
-            Some(p) if p.loads("unicode-math") => StylePreset::UnicodeMath,
+        let preset = match self.mechanism() {
+            Mechanism::UnicodeMath => StylePreset::UnicodeMath,
             _ => StylePreset::Latex,
         };
         Ok(self
@@ -257,31 +259,44 @@ impl Engine {
         mechanism: Option<Mechanism>,
     ) -> Declarations {
         let mechanism = mechanism.unwrap_or_else(|| self.mechanism());
-        let reference = profile.latex_forms();
+        // The spellings the characters are declared to mean come from the
+        // profile with every form forced to commands; under unicode-math
+        // they are that package's names where it lacks amssymb's.
+        let mut reference = profile.latex_forms();
+        if mechanism == Mechanism::UnicodeMath {
+            reference.preset = StylePreset::UnicodeMath;
+        }
+        let pdflatex = mechanism != Mechanism::UnicodeMath;
         let atoms = self.atoms_used(sources, profile);
         let mut packages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut chars: BTreeSet<char> = BTreeSet::new();
         for atom in &atoms {
             chars.extend(self.table.char_of(atom));
-            if mechanism == Mechanism::UnicodeMath {
+            if !pdflatex {
                 continue;
             }
             let Some(spelling) = print::spelling(atom, &reference, &self.table) else {
                 continue;
             };
             for word in declare::control_words(&spelling) {
-                if let Some(package) = self.table.package_of(&word) {
-                    packages
-                        .entry(package.to_string())
-                        .or_default()
-                        .insert(word);
+                match self.table.package_of(&word) {
+                    // A command no pdflatex package defines is reported
+                    // with its character below, not as a package.
+                    Some("-") => {}
+                    Some(package) => {
+                        packages
+                            .entry(package.to_string())
+                            .or_default()
+                            .insert(word);
+                    }
+                    None => {}
                 }
             }
         }
         let mut decls = Vec::new();
         let mut undeclared = Vec::new();
         for c in chars {
-            if mechanism == Mechanism::UnicodeMath {
+            if !pdflatex {
                 break;
             }
             // The character as the resolver reads it, which is what a
@@ -291,7 +306,22 @@ impl Engine {
             };
             match print::spelling(&atom, &reference, &self.table) {
                 Some(s) if s.is_ascii() => {
-                    if mechanism == Mechanism::Kernel || matches!(atom, Atom::Styled { .. }) {
+                    let unavailable: Vec<String> = declare::control_words(&s)
+                        .into_iter()
+                        .filter(|w| self.table.defined_by(w) == Some("-"))
+                        .collect();
+                    if !unavailable.is_empty() {
+                        undeclared.push((
+                            c,
+                            format!(
+                                "its spelling `{s}` uses \\{}, which no pdflatex package defines",
+                                unavailable.join(", \\")
+                            ),
+                        ));
+                    } else {
+                        // unicode-math-input's own table lacks some symbols
+                        // (↝) and reads others differently (√ as a radical),
+                        // so every character is declared under it too.
                         decls.push(CharDecl {
                             ch: c,
                             atom,
@@ -584,9 +614,11 @@ mod tests {
         names.sort_unstable();
         assert!(names.len() > 30, "{} style commands", names.len());
         for name in names {
+            let known = engine.table.defined_by(name).is_some_and(|s| s != "-")
+                || (engine.table.defined_by(name).is_some() && engine.table.in_unicode_math(name));
             assert!(
-                engine.table.defined_by(name).is_some_and(|s| s != "-"),
-                "\\{name} has no row in packages.tsv, or none that defines it; run tools/gen-packages.py"
+                known,
+                "\\{name} has no row in packages.tsv, or neither a pdflatex package nor unicode-math defines it; run tools/gen-packages.py"
             );
         }
     }
@@ -605,10 +637,16 @@ mod tests {
                 .map(|c| format!("{}={}", c.ch, c.spelling))
                 .collect()
         };
-        // Styled letters only; the script letter reads back as cal.
+        // Every character, the script letter reading back as cal.
         assert_eq!(
             lines(&umi),
-            [r"ℝ=\mathbb{R}", r"ℱ=\mathcal{F}", r"𝛔=\boldsymbol{\sigma}"]
+            [
+                r"ℝ=\mathbb{R}",
+                r"ℱ=\mathcal{F}",
+                r"∈=\in",
+                r"≠=\neq",
+                r"𝛔=\boldsymbol{\sigma}"
+            ]
         );
         assert_eq!(
             umi.packages.keys().collect::<Vec<_>>(),
@@ -735,6 +773,51 @@ mod tests {
         ] {
             assert!(Config::parse(bad, None).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_hole_keeps_no_context_spacing_and_a_standing_group_keeps_its_braces() {
+        let engine = engine_with(
+            r#"
+            [notations.ip]
+            angle = "\\langle #1, #2 \\rangle"
+            bk = "\\bk{#1}{#2}"
+            [notations.E]
+            macro = "\\E{#1}{#2}"
+            sub = "\\mathbb{E}_#1[#2]"
+            [profiles.unicode.notations]
+            ip = "angle"
+            [profiles.ascii.notations]
+            ip = "bk"
+            E = "macro"
+            "#,
+        );
+        let unicode = engine.profile(Some("unicode")).unwrap();
+        let ascii = engine.profile(Some("ascii")).unwrap();
+        let none = RenameMap::new();
+        // The space `plan` put after `\langle` to keep it off `\alpha` is
+        // the source's business, not the hole's.
+        let once = engine
+            .convert(r"$\langle\alpha, b\rangle$", &unicode, &none)
+            .output;
+        assert_eq!(once, "$⟨ α, b ⟩$");
+        assert_eq!(
+            engine.convert(&once, &unicode, &none).output,
+            once,
+            "stable"
+        );
+        // A group standing in a hole stays a group; one that was a script's
+        // operand sheds the script's braces.
+        assert_eq!(
+            engine
+                .convert(
+                    r"$\langle a, {-x} \rangle + \mathbb{E}_{x \sim p}[f]$",
+                    &ascii,
+                    &none
+                )
+                .output,
+            r"$\bk{a}{{-x}} + \E{x \sim p}{f}$"
+        );
     }
 
     #[test]

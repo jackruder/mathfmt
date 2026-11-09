@@ -913,3 +913,101 @@ behaviour that changed:
   `\boldsymbol{\sigma_\theta}` verifies on all fourteen pages under the
   default configuration. `bf_greek = "\\mathbf"` remains for a paper that
   wants pdflatex's reading kept.
+
+### 2026-11-09, the third review
+
+An independent review of project mode and the second review's fixes
+(`90834dc..89ed710`) returned twenty-two findings; `docs/REVIEW-2026-11-09.md`
+lists them with what was done. The behaviour that changed:
+
+- **§11, `declarations` under unicode-math-input.** Every character is
+  declared, not the styled letters alone. Measured: with every symbol of the
+  table declared, all 352 render identically to their commands under
+  pdflatex, delimiters after `\left`, `\middle` and `\bigl` included; left to
+  the package's own table, ten do not compile (`↝`, `⊳`, `Ⓢ`, the black
+  triangles) and six render otherwise (`√` as the radical, `∖`, `′`, `‵`,
+  `ℏ`, `∅`). The README's "knows every symbol" is withdrawn.
+- **§12, `packages.tsv`.** Three columns: the command, what defines it under
+  pdflatex, and whether lualatex with unicode-math defines it. The kernel's
+  `\not@base` stubs (`\mho`, `\leadsto`, `\sqsubset`, `\sqsupset`) count as
+  undefined, so those four are amsfonts'. `\napprox` is defined by no
+  pdflatex package: `latex.tsv` keeps it as an input alias and `≉` has no
+  command spelling, which the table test now requires of every spelling.
+  `\blacktriangleright` and its three kin pointed at the open small
+  triangles; they point at the filled ones. `𝕜` is `\Bbbk`, and a lowercase
+  blackboard letter is spelled with `bb_lower` (`\mathbbm`), since amsfonts'
+  `\mathbb{a}` is another glyph.
+- **§9, under unicode-math.** A profile carries its preset. Under
+  `unicode-math` a Named atom whose curated command that package lacks
+  (`\square`, `\circlearrowleft`, `\blacksquare`, nine in all) is spelled
+  by unicode-math's own name (`\mdlgwhtsquare`), which it always defines.
+  Under a pdflatex mechanism `declarations` never names `unicode-math` and
+  never merges a package into it.
+- **§9, engine.** A FILE that is itself a document, named without a root,
+  is its own root: its preamble decides the engine and the commands, as
+  under `--project`. `--engine` is a selection option, not a `--verify`
+  one: it sets the config's `engine` for the run, and the profile's preset,
+  the declarations' mechanism and the compile follow one rule (unicode-math
+  when the preamble loads it or the engine is not pdflatex).
+- **§9, scripts.** A script operator before or after a thing is `^`, `_`,
+  `\sp` or `\sb`, with whitespace, newlines and comments between, and a
+  prime after a group is `'` or a prime character. The lines before are
+  lexed from their start, since only that tells a comment from code.
+- **§8, holes.** A hole's text is trimmed: the space `plan` added to keep a
+  control word off a letter was the source's seam, not the form's, and made
+  a rewrite grow a space per run. The braces of a binding are dropped only
+  when it was one group that stood as a script's operand; a group standing
+  alone in a hole keeps them (`{-x}`).
+- **§7, `\providecommand`.** It defines a name only when the name is not
+  yet defined, as in TeX, so a section's fallback does not override the
+  package it falls back from.
+- **§3, the reader.** Names resolve as TeX's do: `name.tex` before `name`,
+  for `\include` too; against the root's directory, or against the import
+  path inside a file that `\import` or `\subimport` brought in, where a
+  plain `\input` follows the import path. `\endinput` takes effect at the
+  end of its line. A byte-order mark is skipped. A `.sty` or `.cls` the
+  body inputs is a package. A file nested deeper than 32 or not UTF-8 is
+  listed as missing with the reason. A root with no `\documentclass` is a
+  snippet: all of it is body and its inputs are files. `is_document` lives
+  in the reader, ignores comments and verbatim environments, and is what
+  `--verify` uses.
+- **§11, `--verify`.** A root is a document or a FILE named for
+  verification (every FILE, or a project's root), unless a document among
+  the sources reads it: a subfile or section is verified with its document,
+  and a project whose root is a snippet is verified. A document's copy
+  holds every source it reads, whichever root converted it, so a file two
+  roots share and read under different definitions shows the second root
+  `differs` where it passed before. The output directory gets a
+  subdirectory for every file the document reads, not only the FILEs. The
+  declarations go before the `\begin{document}` TeX acts on (`\begin
+  {document}` with a space; not in a comment, where `\\%` starts one; not
+  in `filecontents` or `verbatim`); a document with none is an error. A
+  snippet verified alone under a root is wrapped with the root's local
+  packages and preamble inputs, and the project's directory is on
+  `TEXINPUTS`.
+- **§11, the command line.** Options before a subcommand are refused with
+  a message, where clap dropped them.
+- **§14.** Fixtures `bb-lowercase`, `bb-lowercase-ascii`, `amsfonts-stubs`,
+  `structured-group-before-sp`, `notation-script-operand-newline`,
+  `notation-hole-after-control-word`, `notation-standing-group-in-hole`;
+  the `paper` project case gains a `\providecommand`; `\mathbb{R^n}` moves
+  from `style-distribution` to the repairs case, since `\mathbb{n}` is
+  another glyph in amsfonts and the conversion repairs it. Tests for the
+  reader's resolution, snippet roots and depth, `is_document`,
+  `\providecommand`, script detection, hole spacing and standing groups,
+  the engine flag, options before a subcommand, a shared file under two
+  roots, and root selection.
+- **§12, `∅`.** Found when the paper was checked with every character
+  declared: it writes `\varnothing`, and `∅` was declared `\emptyset`, which
+  pdflatex draws as a slashed zero where `\varnothing` is the slashed circle
+  that the character is. The curated spelling of U+2205 is now
+  `\varnothing`, as unicode-math names it; `\emptyset` still reads as the
+  same atom and is a fifth collapse, documented in the README.
+- **Ruled on, not changed.** The unicode-math preset rewrites `\mathbf`,
+  `\mathit`, `\mathsf` and `\mathtt` to `\sym…`, which changes the glyph
+  when the text font differs from the math font: this is the documented
+  shape collapse under that package, and `--verify` reports it. About five
+  thousand nested braces overflow the parser's stack, as since version
+  zero. A `\begin{document}` inside `\iffalse…\fi` is still taken as the
+  real one. The paper's numbers in the README come from the author's own
+  tree, which the reviewer could not read.

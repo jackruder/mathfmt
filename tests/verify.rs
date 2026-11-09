@@ -459,3 +459,101 @@ fn a_snippet_finds_its_macro_package_in_another_directory() {
     assert!(out.contains("verified: s.tex (1 page identical)"), "{out}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Two roots share a file whose conversion depends on each root's own
+/// definitions: the first converts it, and the second's verdict must see
+/// the converted copy, not the original through TEXINPUTS.
+#[test]
+fn a_file_two_roots_share_is_verified_as_converted_in_both() {
+    if skip_without_tex("shared file") {
+        return;
+    }
+    let dir = tree(
+        "shared",
+        &[
+            ("a.tex", "\\documentclass{article}\n\\usepackage{unicode-math-input}\n\\newcommand{\\X}{\\alpha}\n\\begin{document}\nA: \\input{common}\n\\end{document}\n"),
+            ("b.tex", "\\documentclass{article}\n\\usepackage{unicode-math-input}\n\\newcommand{\\X}{\\beta}\n\\begin{document}\nB: \\input{common}\n\\end{document}\n"),
+            ("common.tex", "$\\X + 1$\n"),
+        ],
+    );
+    let (code, out) = verify_in(&dir, &["--project", "a.tex", "b.tex", "--verify"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("verified: a.tex"), "{out}");
+    assert!(
+        out.contains("differs: b.tex"),
+        "the second root sees the file as the first converted it:\n{out}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// In project mode a root without `\documentclass` is a snippet root and is
+/// verified; a document another document reads (a subfile) is not a root;
+/// `\documentclass` inside verbatim makes no document; an `\include` whose
+/// target is not among the FILEs still gets its output directory; the
+/// declarations go before a `\begin {document}` with a space.
+#[test]
+fn roots_are_chosen_as_the_spec_says() {
+    if skip_without_tex("roots") {
+        return;
+    }
+    let dir = tree(
+        "roots2",
+        &[
+            ("snippet.tex", "Text $a \\le b$ \\input{part}\n"),
+            ("part.tex", "$c \\ne d$\n"),
+            ("sub/main.tex", "\\documentclass{article}\n\\usepackage{subfiles}\n\\usepackage{amssymb}\n\\begin{document}\n\\subfile{sec/part}\n\\include{ch/one}\n\\end{document}\n"),
+            ("sub/sec/part.tex", "\\documentclass[../main.tex]{subfiles}\n\\begin{document}\n$x \\le y$\n\\end{document}\n"),
+            ("sub/ch/one.tex", "$p \\ge q$\n"),
+            ("verb.tex", "\\begin{verbatim}\n\\documentclass{article}\n\\end{verbatim}\n$\\alpha \\le 1$\n"),
+            ("spaced.tex", "\\documentclass{article}\n\\begin {document}\n$\\alpha$\n\\end{document}\n"),
+            ("nobegin.tex", "\\documentclass{article}\n% \\begin{document}\n"),
+        ],
+    );
+    let (code, out) = verify_in(
+        &dir,
+        &["--profile", "ascii", "--project", "snippet.tex", "--verify"],
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("verified: snippet.tex (1 page identical)"),
+        "{out}"
+    );
+    let (code, out) = verify_in(
+        &dir,
+        &[
+            "--profile",
+            "ascii",
+            "--verify",
+            "sub/main.tex",
+            "sub/sec/part.tex",
+            "verb.tex",
+        ],
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("verified: sub/main.tex (2 pages identical)"),
+        "an \\include starts a page:\n{out}"
+    );
+    assert!(
+        out.contains("verified: verb.tex (1 page identical)"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("sec/part.tex:"),
+        "a subfile is verified with its document:\n{out}"
+    );
+    let (code, out) = verify_in(
+        &dir,
+        &["--verify", "--declare", "spaced.tex", "nobegin.tex"],
+    );
+    assert_eq!(code, Some(2), "{out}");
+    assert!(
+        out.contains("verified: spaced.tex (1 page identical)\n  with 2 declaration lines added"),
+        "{out}"
+    );
+    assert!(
+        out.contains("error: nobegin.tex:"),
+        "a document with no live \\begin{{document}} is an error, not a pass:\n{out}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

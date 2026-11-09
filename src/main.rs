@@ -61,7 +61,8 @@ enum Command {
         #[command(flatten)]
         select: Select,
         /// How the document reads Unicode math (default: `unicode_input`
-        /// in the config, else what the root's preamble says)
+        /// in the config, else unicode-math when the preamble loads it or
+        /// the engine is not pdflatex, else unicode-math-input)
         #[arg(long = "with", value_enum, value_name = "MECHANISM")]
         with: Option<With>,
     },
@@ -93,9 +94,15 @@ struct Select {
     #[arg(long)]
     project: bool,
     /// The root document of the FILEs: its preamble's packages and
-    /// definitions apply to them (default: `root` in mathfmt.toml)
+    /// definitions apply to them (default: `root` in mathfmt.toml; a FILE
+    /// that is itself a document is its own root)
     #[arg(long, value_name = "FILE")]
     root: Option<PathBuf>,
+    /// The TeX engine: what --verify compiles with, and what the profile's
+    /// commands and `declarations` assume (default: `engine` in the config,
+    /// else what the root's preamble says, else pdflatex)
+    #[arg(long, value_name = "PROGRAM")]
+    engine: Option<String>,
 }
 
 #[derive(Args, Clone)]
@@ -118,10 +125,6 @@ struct RunArgs {
     /// verdict per document or snippet, exit 1 on a difference
     #[arg(long, conflicts_with_all = ["write", "check", "diff", "emit"])]
     verify: bool,
-    /// The TeX engine --verify compiles with (default: `engine` in the
-    /// config, else what the root's preamble says, else pdflatex)
-    #[arg(long, value_name = "PROGRAM", requires = "verify")]
-    engine: Option<String>,
     /// Under --verify, add what `mathfmt declarations` prints to a
     /// document's preamble, on both sides
     #[arg(long, requires = "verify")]
@@ -196,6 +199,25 @@ impl From<With> for Mechanism {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Options given before a subcommand belong to the top level and would
+    // be dropped on the floor: `mathfmt -p ascii declarations` is not
+    // `mathfmt declarations -p ascii`.
+    if cli.command.is_some() {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(at) = args
+            .iter()
+            .position(|a| matches!(a.as_str(), "declarations" | "project" | "table" | "rename"))
+        {
+            if at > 0 {
+                eprintln!(
+                    "mathfmt: `{}` before the subcommand `{}` would be ignored; put options after it",
+                    args[..at].join(" "),
+                    args[at]
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
     let result = match cli.command {
         Some(Command::Table { profile, config }) => table(profile, config),
         Some(Command::Rename { from, to, run }) => convert(run, Some((from, to))),
@@ -302,6 +324,12 @@ impl Loader<'_> {
             return Ok(g);
         }
         let mut engine = Engine::with_root(config, root.as_deref())?;
+        // The engine named on the command line is the config's `engine`
+        // for this run, so the profile, the declarations and --verify
+        // agree on it.
+        if self.select.engine.is_some() {
+            engine.config.engine = self.select.engine.clone();
+        }
         for m in &self.select.macros {
             engine.add_macro_file(m)?;
         }
@@ -388,7 +416,12 @@ fn load(select: &Select) -> Result<Loaded> {
         }
         for (i, p) in select.files.iter().enumerate() {
             let near = loader.near(p);
-            let g = loader.group(&near, None)?;
+            // A document named on its own is its own root: its preamble
+            // decides the engine and the commands, as under --project.
+            let own_root = (select.root.is_none()
+                && mathfmt_core::project::is_document(&inputs[i].text))
+            .then(|| p.clone());
+            let g = loader.group(&near, own_root.as_deref())?;
             loader.groups[g].indices.push(i);
             group_of.push(g);
         }
@@ -410,6 +443,7 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
     if args.write && args.select.files.is_empty() && !args.select.project {
         bail!("--write needs FILEs or --project; stdin is never written back");
     }
+
     let Loaded {
         inputs,
         groups,
@@ -535,11 +569,15 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
                     converted: &c.outcome.output,
                     engine: &group.engine,
                     profile: &group.profile,
-                    program: args
-                        .engine
-                        .clone()
-                        .unwrap_or_else(|| group.engine.program()),
+                    program: group.engine.program(),
                     project: args.select.project.then_some(group_of[i]),
+                    is_root: !args.select.project
+                        || group
+                            .engine
+                            .project
+                            .as_ref()
+                            .and_then(|p| p.files.first())
+                            .is_some_and(|f| f == &c.input.path.clone().unwrap_or_default()),
                     declare: declared[group_of[i]].as_deref(),
                 })
             })
@@ -616,6 +654,7 @@ fn project(root: Option<PathBuf>, config: Option<PathBuf>) -> Result<ExitCode> {
         macros: Vec::new(),
         project: true,
         root,
+        engine: None,
     };
     let loaded = load(&select)?;
     let mut out = io::stdout().lock();

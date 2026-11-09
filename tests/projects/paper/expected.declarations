@@ -1,7 +1,15 @@
 % packages the notation's commands need and the preamble does not load
 \usepackage{unicode-math-input}
-% styled letters, as the profile spells them (unicode-math-input follows pdflatex, which has no bold Greek under \mathbf and no blackboard digits)
+% Unicode math input: each character means what the profile spells it as (unicode-math-input's own table lacks some and reads others differently)
+\umiDeclareMathChar{Σ}{\Sigma}
+\umiDeclareMathChar{θ}{\theta}
+\umiDeclareMathChar{μ}{\mu}
 \umiDeclareMathChar{ℝ}{\mathbb{R}}
+\umiDeclareMathChar{→}{\rightarrow}
+\umiDeclareMathChar{∈}{\in}
+\umiDeclareMathChar{∞}{\infty}
+\umiDeclareMathChar{≤}{\leq}
+\umiDeclareMathChar{⊤}{\top}
 \umiDeclareMathChar{𝐖}{\mathbf{W}}
 \umiDeclareMathChar{𝐱}{\mathbf{x}}
 \umiDeclareMathChar{𝒩}{\mathcal{N}}

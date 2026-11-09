@@ -55,8 +55,9 @@ pub struct Table {
     info: HashMap<char, SymbolInfo>,
     /// Plain Greek codepoints LaTeX has a name for.
     greek_names: HashMap<char, String>,
-    /// Control-word name → what defines it: `kernel`, a package, or `-`.
-    packages: HashMap<String, String>,
+    /// Control-word name → what defines it under pdflatex (`kernel`, a
+    /// package, or `-`), and whether unicode-math defines it.
+    packages: HashMap<String, (String, bool)>,
 }
 
 impl Table {
@@ -70,8 +71,11 @@ impl Table {
             packages: HashMap::new(),
         };
         for row in Self::rows(PACKAGES) {
-            if let [name, package] = row[..] {
-                t.packages.insert(name.to_string(), package.to_string());
+            if let [name, package, unicode_math] = row[..] {
+                t.packages.insert(
+                    name.to_string(),
+                    (package.to_string(), unicode_math.trim() == "yes"),
+                );
             }
         }
         t.load_unicode_math(UNICODE_MATH);
@@ -236,16 +240,27 @@ impl Table {
     /// `amssymb`); `None` for a kernel command and for one the table does
     /// not list. `-` marks a command no package the generator tried defines.
     pub fn package_of(&self, command: &str) -> Option<&str> {
-        self.packages
-            .get(command)
-            .map(String::as_str)
-            .filter(|p| *p != "kernel")
+        self.defined_by(command).filter(|p| *p != "kernel")
     }
 
-    /// What `packages.tsv` says defines a command: `kernel`, a package, or
-    /// `-` for none the generator tried; `None` when it has no row.
+    /// What `packages.tsv` says defines a command under pdflatex: `kernel`,
+    /// a package, or `-` for none the generator tried; `None` when it has
+    /// no row.
     pub fn defined_by(&self, command: &str) -> Option<&str> {
-        self.packages.get(command).map(String::as_str)
+        self.packages.get(command).map(|(p, _)| p.as_str())
+    }
+
+    /// Does lualatex with unicode-math define this command? A command the
+    /// table does not know (a user's macro) is taken to exist.
+    pub fn in_unicode_math(&self, command: &str) -> bool {
+        self.packages.get(command).map_or(true, |(_, um)| *um)
+    }
+
+    /// unicode-math's own name for an atom's character (`mdlgwhtsquare`),
+    /// the spelling that package always defines.
+    pub fn unicode_math_name(&self, atom: &Atom) -> Option<&str> {
+        let cp = self.char_of(atom)?;
+        self.info.get(&cp).and_then(|i| i.name.as_deref())
     }
 
     /// True when the atom is a plain Greek letter LaTeX can name.
@@ -305,7 +320,7 @@ mod tests {
                 let source = t.defined_by(name);
                 assert!(
                     source.is_some_and(|s| s != "-"),
-                    "\\{name} (in `{spelling}`) has no row in packages.tsv, or none that defines it; run tools/gen-packages.py"
+                    "\\{name} (in `{spelling}`) is defined by no pdflatex package in packages.tsv; a spelling must be, or the row must lose it; run tools/gen-packages.py"
                 );
                 checked += 1;
             }
@@ -325,6 +340,11 @@ mod tests {
         assert_eq!(t.atom_of_name("phi"), Some(Atom::Named('ϕ')));
         assert_eq!(t.atom_of_name("emptyset"), Some(Atom::Named('∅')));
         assert_eq!(t.atom_of_name("varnothing"), Some(Atom::Named('∅')));
+        assert_eq!(
+            t.latex_of(&Atom::Named('∅')),
+            Some("\\varnothing"),
+            "the character is the circle with a slash, which is amssymb's \\varnothing; \\emptyset is the slashed zero"
+        );
         assert_eq!(t.atom_of_name("le"), Some(Atom::Named('≤')));
         assert_eq!(t.atom_of_name("|"), Some(Atom::Named('‖')));
         assert_eq!(t.atom_of_char('𝟙'), Some(Atom::styled('1', Style::Bb)));
@@ -355,7 +375,34 @@ mod tests {
         assert_eq!(t.package_of("leqslant"), Some("amssymb"));
         assert_eq!(t.package_of("mathbbm"), Some("bbm"));
         assert_eq!(t.package_of("boldsymbol"), Some("amsmath"));
-        assert_eq!(t.package_of("symbfup"), Some("unicode-math"));
+        assert_eq!(
+            t.package_of("symbfup"),
+            Some("-"),
+            "no pdflatex package has it"
+        );
+        assert!(t.in_unicode_math("symbfup") && t.in_unicode_math("leqslant"));
+        assert!(!t.in_unicode_math("square") && !t.in_unicode_math("leadsto"));
+        assert!(
+            t.in_unicode_math("mymacro"),
+            "an unknown command is assumed to exist"
+        );
+        assert_eq!(
+            t.package_of("mho"),
+            Some("amsfonts"),
+            "the kernel's \\mho is a stub"
+        );
+        assert_eq!(
+            t.unicode_math_name(&Atom::Named('□')),
+            Some("mdlgwhtsquare")
+        );
+        assert_eq!(t.latex_of(&Atom::styled('k', Style::Bb)), Some("\\Bbbk"));
+        assert_eq!(
+            t.latex_of(&Atom::Named('≉')),
+            None,
+            "no pdflatex package defines \\napprox"
+        );
+        assert_eq!(t.atom_of_name("napprox"), Some(Atom::Named('≉')));
+        assert_eq!(t.atom_of_name("blacktriangleright"), Some(Atom::Named('▸')));
         // a symbol unicode-math knows but LaTeX has no name for
         assert_eq!(t.atom_of_char('∆'), Some(Atom::Named('∆')));
         assert_eq!(t.latex_of(&Atom::Named('∆')), None);

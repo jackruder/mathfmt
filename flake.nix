@@ -141,6 +141,8 @@
                   listings
                   url
                   doublestroke
+                  # a test's document uses the subfiles class
+                  subfiles
                   # the unicode-math project case compiles with lualatex
                   unicode-math
                   fontspec

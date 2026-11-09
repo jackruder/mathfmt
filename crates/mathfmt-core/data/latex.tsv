@@ -45,7 +45,7 @@
 22D7	\gtrdot	
 2248	\approx	
 224A	\approxeq	
-2249	\napprox	
+2249		\napprox
 223C	\sim	
 2241	\nsim	
 2243	\simeq	
@@ -180,8 +180,8 @@
 25BD	\bigtriangledown	
 25C1	\triangleleft	
 25B7	\triangleright	
-25C3	\blacktriangleleft	
-25B9	\blacktriangleright	
+25C2	\blacktriangleleft	
+25B8	\blacktriangleright	
 2212	-	\minus
 # large operators
 2211	\sum	
@@ -289,7 +289,7 @@
 2200	\forall	
 2203	\exists	
 2204	\nexists	
-2205	\emptyset	\varnothing
+2205	\varnothing	\emptyset
 00AC	\neg	\lnot
 2135	\aleph	
 2136	\beth	
@@ -300,6 +300,7 @@
 2118	\wp	
 2111	\Im	
 211C	\Re	
+1D55C	\Bbbk	
 2127	\mho	
 221A	\surd	
 2220	\angle	
@@ -320,8 +321,8 @@
 25CA	\lozenge	\Diamond
 25C6	\blacklozenge	
 25CB	\bigcirc	
-25B2	\blacktriangle	
-25BC	\blacktriangledown	
+25B4	\blacktriangle	
+25BE	\blacktriangledown	
 25B5	\vartriangle	
 25BF	\triangledown	
 24C8	\circledS	
