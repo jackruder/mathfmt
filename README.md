@@ -174,10 +174,13 @@ differs: main.tex: 1 of 14 pages
 ```
 
 One page, and the reason is the paper's: it writes `\mathbf{\sigma_\theta}`,
-which pdflatex draws plain, and the Unicode `𝛔` is declared bold. With
-`bf_greek = "\\mathbf"` in the profile, which keeps pdflatex's reading, the
-verdict is `verified: main.tex (14 pages identical)`, in about eight seconds
-for the seventeen files.
+which pdflatex draws plain, where its author meant all of it bold. mathfmt
+reads it as meant: both profiles write it bold (`\boldsymbol{\sigma_\theta}`,
+`𝛔_{𝛉}`), so the difference is a repair and the check has found a slip in
+the paper. With those two occurrences written `\boldsymbol{\sigma_\theta}`
+the verdict is `verified: main.tex (14 pages identical)`, in about eight
+seconds for the seventeen files. A paper that wants pdflatex's plain reading
+kept instead sets `bf_greek = "\\mathbf"` in its profile.
 
 A FILE without `\documentclass` is a snippet and is wrapped in a preamble
 (`--preamble FILE`, or a built-in one that loads the usual packages and

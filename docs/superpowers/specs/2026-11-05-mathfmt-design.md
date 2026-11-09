@@ -899,3 +899,17 @@ behaviour that changed:
   (bbm is METAFONT only), as any compile does. A `differs` fixture that
   holds several cases can hide one of them changing; the cases are split
   when one does.
+
+### 2026-11-09, a ruling on bold Greek
+
+- **§17, `bf_greek`.** Ruled by the author on the paper's own case:
+  `\mathbf{\sigma_\theta}` means all of it bold, the sigma and its
+  subscript. The default therefore stands (`bf_greek` is `\boldsymbol`,
+  and the style reaches through the script), and where pdflatex drew the
+  source plain the conversion's bold is a repair, reported by `--verify` as
+  a difference until the source says what it means. Measured: both
+  profiles' output sets the pair in CMMIB10 and CMMIB7 where the original
+  used CMMI10 and CMMI7, and the paper with its two occurrences written
+  `\boldsymbol{\sigma_\theta}` verifies on all fourteen pages under the
+  default configuration. `bf_greek = "\\mathbf"` remains for a paper that
+  wants pdflatex's reading kept.
