@@ -21,10 +21,19 @@ pages compared. See `docs/superpowers/specs/2026-11-05-mathfmt-design.md`.
 ## Install
 
 ```sh
+uv tool install mathfmt-tex                 # or pipx / pip: a prebuilt binary, no Rust
 cargo install --path .                      # any platform with a Rust toolchain
 nix build                                   # Linux and macOS; ./result/bin/mathfmt
 nix profile install .                       # or add the flake's package to your configuration
 ```
+
+The Python package is named `mathfmt-tex` because `mathfmt` on PyPI is an
+unrelated project; the command it installs is `mathfmt`. Its wheels hold the
+compiled binary and nothing else, one per platform (Linux x86-64 and ARM,
+glibc and musl; macOS Intel and Apple; Windows x64), built by
+`.github/workflows/wheels.yml` on the GitHub mirror and published to PyPI
+from a `v*` tag. `maturin build --release` in the dev shell builds one for
+the machine at hand.
 
 ## Use
 
@@ -294,6 +303,26 @@ Collaborators who prefer the macros write a profile with
 
 ## As a pre-commit hook
 
+For collaborators without Rust, a local hook that installs the wheel into
+pre-commit's own environment:
+
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: mathfmt
+        name: mathfmt
+        entry: mathfmt
+        language: python
+        additional_dependencies: ["mathfmt-tex==0.1.0"]
+        args: ["--write"]          # or ["--check"]: fail the commit, change nothing
+        files: \.(tex|sty)$
+```
+
+Before the package is on PyPI, `additional_dependencies` takes a wheel's
+path or URL instead. With a Rust toolchain, the repository is a hook repo
+itself, and pre-commit builds the binary with cargo on first use:
+
 ```yaml
 repos:
   - repo: ssh://forgejo@git.buttermilks.rocks/jack/mathfmt.git
@@ -302,6 +331,10 @@ repos:
       - id: mathfmt          # rewrites staged .tex/.sty files to the profile
       # - id: mathfmt-check  # or: fail the commit, change nothing
 ```
+
+`tests/pre-commit-e2e.sh` builds the wheel and runs the first form in a
+scratch repository, twice: the first run rewrites and fails, as pre-commit
+does when a hook changes a file, and the second passes.
 
 ## Known collapses
 

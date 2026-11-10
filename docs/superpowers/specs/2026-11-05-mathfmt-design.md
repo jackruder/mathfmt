@@ -440,7 +440,8 @@ mathfmt/
   no network (a phalanix seat's proxy does not allow crates.io; the nix daemon's
   fetches are unfiltered); `checks` run `cargo test` and `cargo clippy`.
 - Linux and macOS through the flake and `cargo install`; Windows through
-  `cargo install` and, later, release binaries (`cargo-dist`).
+  `cargo install`; every platform through the Python wheel (amendment of
+  2026-11-10, "the Python distribution").
 - pre-commit: `.pre-commit-hooks.yaml` with id `mathfmt` (`language: rust`,
   `args: [--write]`, `files: \.(tex|sty)$`).
 
@@ -1100,3 +1101,34 @@ that changed:
 - **Ruled on, not changed.** `\InputIfFileExists{x}{a}{b}` lists both
   branches. `e^\alpha x` matched by `e^#1 x` writes `e^{{α}} x`, stable and
   rendering the same. Five thousand nested braces still overflow the stack.
+
+### 2026-11-10, the Python distribution
+
+- **§16, distribution.** A Python package, `mathfmt-tex`, whose wheels hold
+  the compiled binary and nothing else (`pyproject.toml`, maturin with
+  `bindings = "bin"`, the version Cargo's): `pip`, `pipx` or `uv tool`
+  install a `mathfmt` command with no Rust toolchain. `mathfmt` on PyPI is
+  an unrelated project (Word equations), hence the name; the command keeps
+  its name, and a machine with both would have two `mathfmt` commands.
+  This replaces `cargo-dist` in the plan: the wheel is the binary, and pip
+  already knows how to pick one per platform.
+- **Wheels.** `.github/workflows/wheels.yml` runs on the GitHub mirror only
+  (every job checks `github.server_url`, so a Forgejo that reads
+  `.github/workflows` skips it): manylinux and musllinux for x86-64 and
+  ARM, macOS Intel and Apple, Windows x64, and an sdist; each native wheel
+  is installed and run. A `v*` tag publishes to PyPI by trusted publishing,
+  which needs the PyPI project to name the repository, the workflow and the
+  `pypi` environment first. The workflow passes `actionlint`; it has not
+  yet run on GitHub.
+- **pre-commit without Rust.** A `repo: local` hook with
+  `language: python` and `additional_dependencies: ["mathfmt-tex==…"]`:
+  pre-commit installs the wheel into its own environment. A hook repo with
+  `language: python` would not do, since pre-commit installs the hook repo
+  itself from source, which with maturin means cargo. The `language: rust`
+  hooks stay for those who have it.
+- **§14.** A flake check `wheel` builds the wheel offline from the vendored
+  crates (nixpkgs' `maturinBuildHook`), installs it and runs its `mathfmt`
+  on a line of math. `tests/pre-commit-e2e.sh`, run by hand since it needs
+  the network for pre-commit, builds the wheel and runs the local hook in a
+  scratch repository: the first run rewrites the file and fails, the second
+  passes.

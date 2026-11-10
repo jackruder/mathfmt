@@ -1,0 +1,125 @@
+# Wheels of mathfmt-tex for every platform pre-commit users run, built on
+# the GitHub mirror (Forgejo pushes to it). A wheel holds the compiled
+# `mathfmt` binary only (pyproject.toml), so installing it needs no Rust.
+# A tag `v*` also publishes to PyPI through trusted publishing: the PyPI
+# project must name this repository and this workflow as its publisher.
+#
+# Every job is skipped anywhere but github.com, so a Forgejo instance that
+# reads .github/workflows does not try to run it.
+
+name: wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+        libc: [manylinux, musllinux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.libc == 'manylinux' && 'auto' || 'musllinux_1_2' }}
+          args: --release --locked --out dist
+      - name: Run the wheel's mathfmt
+        if: matrix.target == 'x86_64' && matrix.libc == 'manylinux'
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          /tmp/venv/bin/mathfmt --version
+          printf '%s\n' '$\alpha \in \mathbb{R}$' | /tmp/venv/bin/mathfmt | grep -Fx '$α ∈ ℝ$'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}-${{ matrix.libc }}
+          path: dist
+
+  macos:
+    if: github.server_url == 'https://github.com'
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: macos-14
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+      - name: Run the wheel's mathfmt
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          /tmp/venv/bin/mathfmt --version
+          printf '%s\n' '$\alpha \in \mathbb{R}$' | /tmp/venv/bin/mathfmt | grep -Fx '$α ∈ ℝ$'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    if: github.server_url == 'https://github.com'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --locked --out dist
+      - name: Run the wheel's mathfmt
+        shell: bash
+        run: |
+          python -m venv venv
+          venv/Scripts/pip install dist/*.whl
+          venv/Scripts/mathfmt --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  sdist:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    if: github.server_url == 'https://github.com' && startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

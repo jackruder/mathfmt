@@ -40,6 +40,10 @@ work in the repository. It is loaded by every seat of the mathfmt rig
   `tests/dev.sh`: the dev shell wrapper. `flake.nix`: dev shell,
   package and checks. `src/verify.rs`: the `--verify` mode (compile both
   sides, rasterize, compare).
+- `pyproject.toml`: the Python distribution `mathfmt-tex`, a wheel holding
+  the binary only (maturin, `bindings = "bin"`); `.github/workflows/wheels.yml`
+  builds it per platform on the GitHub mirror and publishes from a `v*` tag;
+  `tests/pre-commit-e2e.sh` runs it as a pre-commit hook by hand.
 - `.phalanix/`: the rig (lead, and task/review/question templates) and its
   roles, for waves run on phalanix.
 
@@ -70,7 +74,8 @@ root. If a seat's PATH has no bash for the shebang, run
   `nix build`, `nix flake check` or a wrapper run that needs a new file; a new
   dependency reaches the shell once the updated `Cargo.lock` is added.
 - `nix build` builds the binary and runs the tests. The flake checks are
-  `build`, `clippy`, `fmt` and `verify`: `nix build .#checks.x86_64-linux.<name>`,
+  `build`, `clippy`, `fmt`, `verify` and `wheel` (the Python wheel builds
+  offline and its `mathfmt` runs): `nix build .#checks.x86_64-linux.<name>`,
   or in a seat `/run/current-system/sw/bin/nix build ./repo#checks.x86_64-linux.<name>`.
   `verify` brings a TeX Live and runs `tests/verify.rs` with
   `MATHFMT_VERIFY_REQUIRED` set; elsewhere that test skips itself when

@@ -32,6 +32,49 @@
         ];
       };
 
+      # What the Python wheel's build sees: the crates and what maturin reads
+      # (pyproject.toml, and README.md as the long description).
+      wheelSrc = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.unions [
+          ./Cargo.toml
+          ./Cargo.lock
+          ./src
+          ./crates
+          ./pyproject.toml
+          ./README.md
+        ];
+      };
+
+      # The wheel, built offline with maturin from the vendored crates and
+      # installed into a Python environment: the same artifact pip installs.
+      mkWheel =
+        pkgs:
+        pkgs.python3Packages.buildPythonPackage {
+          pname = "mathfmt-tex";
+          inherit version;
+          src = wheelSrc;
+          pyproject = true;
+          cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+          nativeBuildInputs = [
+            pkgs.rustPlatform.cargoSetupHook
+            pkgs.rustPlatform.maturinBuildHook
+          ];
+          # The wheel has no Python module; what it must do is run, from
+          # where pip put it.
+          doCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+            out_bin="$out/bin/mathfmt"
+            test -x "$out_bin"
+            "$out_bin" --version | tee /dev/stderr | grep -q "mathfmt ${version}"
+            printf '%s\n' '$\alpha \in \mathbb{R}$' | "$out_bin" | tee /dev/stderr | grep -qx '\$α ∈ ℝ\$'
+            echo "wheel check: the installed mathfmt runs"
+            runHook postInstallCheck
+          '';
+          meta.mainProgram = "mathfmt";
+        };
+
       mkPackage =
         pkgs:
         pkgs.rustPlatform.buildRustPackage {
@@ -54,6 +97,7 @@
     {
       packages = forAllSystems (pkgs: rec {
         mathfmt = mkPackage pkgs;
+        wheel = mkWheel pkgs;
         default = mathfmt;
       });
 
@@ -75,6 +119,7 @@
               rustfmt
               rust-analyzer
               python3 # tools/gen-table.py
+              maturin # the Python wheel (pyproject.toml)
             ];
             CARGO_VENDOR_DIR = "${vendor}";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
@@ -109,6 +154,9 @@
         {
           # The package, with `cargo test --workspace` as its check phase.
           build = mathfmt;
+
+          # The Python wheel builds offline and its `mathfmt` runs.
+          wheel = mkWheel pkgs;
 
           # The same vendored build, running clippy instead of a build.
           clippy = mathfmt.overrideAttrs (old: {
