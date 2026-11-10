@@ -108,16 +108,27 @@ inputs, in reading order. A package is read and never rewritten. The reader
 does not evaluate conditionals, skips a file name built by a macro, and knows
 a distributed package by its name only.
 
-The preamble also says what the document is written for. A document whose
-preamble loads `unicode-math`, named alone or as a root, is compiled with
-lualatex by `--verify`, and a profile's commands for the math alphabets
-become unicode-math's (`\symbf`, `\symbb`, `\symcal`) instead of `\mathbf`,
-`\mathbb`, `\mathcal`, which that package typesets differently; a symbol
-whose amssymb name that package lacks (`\square`) is written by its
-unicode-math name (`\mdlgwhtsquare`). `style_preset = "latex"` or
-`"unicode-math"` in a profile decides it by hand; `--engine` or `engine` in
-the config names the program, and the commands, the declarations and
-`--verify` all follow it.
+The preamble also says what the document is written for. Whether it loads
+`unicode-math` decides the commands: a profile's commands for the math
+alphabets become unicode-math's (`\symbf`, `\symbb`, `\symcal`) instead of
+`\mathbf`, `\mathbb`, `\mathcal`, which that package typesets differently,
+and a symbol whose amssymb name that package lacks or draws as another glyph
+is written by unicode-math's own name (`\square` becomes `\mdlgwhtsquare`, ▸
+becomes `\smallblacktriangleright`); read back, those names mean what
+unicode-math draws. A lualatex document with fontspec and no unicode-math
+keeps `\mathbf`. The root is `--root`, else the config's `root`, else, for a
+file named on its own, the document itself, or the main document a subfile
+names. `style_preset = "latex"` or `"unicode-math"` in a profile decides the
+commands by hand; `--engine` or `engine` in the config names the program
+`--verify` runs, which otherwise is lualatex for a preamble that loads
+`unicode-math` or `fontspec`. Without a root, an engine other than pdflatex
+is taken to mean unicode-math, which is what `--verify`'s own snippet
+preamble for it loads.
+
+When a root is known, a conversion that writes a command the preamble does
+not provide (`\mathbbm` without bbm) gets a `package-not-loaded` warning.
+With bbold or mathbbol loaded, lowercase and digit blackboard letters are
+written with `\mathbb`, which those packages extend.
 
 `mathfmt declarations` prints what the preamble must hold for the notation to
 compile in either form: the packages the profile's commands come from that
@@ -142,8 +153,11 @@ config):
 | | |
 |---|---|
 | `unicode-math-input` | pdflatex with that package, which reads a character after `\big` or as a script where the kernel's mechanism does not. Every character is declared all the same: the package's own table lacks some symbols and reads others as something else (`√` as the radical). The default under pdflatex. |
-| `kernel` | pdflatex with `\DeclareUnicodeCharacter` and no package. Every character is declared, inside `\ensuremath`, so it also works in text. `\big⟨` does not compile. |
+| `kernel` | pdflatex with `\DeclareUnicodeCharacter` and no package. Every character the math uses is declared, inside `\ensuremath`, so it also works in text (mathfmt reads math only, so a character that appears only in text is not seen). `\big⟨` does not compile, and the primes cannot be declared at all: a declared `′` before a script is a double superscript. |
 | `unicode-math` | lualatex or xelatex with unicode-math. The characters are native; nothing is declared. |
+
+Without unicode-math, lualatex reads Unicode math through unicode-math-input
+as pdflatex does.
 
 ### Proving a conversion is safe
 
@@ -308,7 +322,11 @@ configurable:
   `\Im` from cmsy, and they look different. Set `spellings."frak:I" =
   "\\mathfrak{I}"` (and `frak:R`) for a paper that means the letter.
 
-- **∅ and ⌀.** `\emptyset` (pdflatex's slashed zero) and `\varnothing`
+- **The primes.** The characters `′`, `″` and `‴` are the superscript primes
+  that `'`, `''` and `'''` write, under unicode-math-input and unicode-math
+  alike, so every profile writes them that way; `\prime` is the unraised
+  glyph and is left alone, and `‵` has no command spelling.
+- **`\emptyset` and `\varnothing`.** `\emptyset` (pdflatex's slashed zero) and `\varnothing`
   (amssymb's slashed circle) are one codepoint, U+2205, whose glyph is the
   circle. The `ascii` profile spells it `\varnothing`; set
   `spellings."∅" = "\\emptyset"` for a paper that means the zero.

@@ -16,6 +16,7 @@ const ALPHABETS: &str = include_str!("../data/alphabets.tsv");
 const GREEK: &str = include_str!("../data/greek.tsv");
 const LATEX: &str = include_str!("../data/latex.tsv");
 const PACKAGES: &str = include_str!("../data/packages.tsv");
+const DEFINED: &str = include_str!("../data/defined.tsv");
 
 /// Math classes whose codepoints are symbols an author types, as opposed to
 /// accents and over/under marks that take an argument.
@@ -56,8 +57,15 @@ pub struct Table {
     /// Plain Greek codepoints LaTeX has a name for.
     greek_names: HashMap<char, String>,
     /// Control-word name → what defines it under pdflatex (`kernel`, a
-    /// package, or `-`), and whether unicode-math defines it.
-    packages: HashMap<String, (String, bool)>,
+    /// package, or `-`), whether unicode-math defines it, and whether it
+    /// draws there the glyph of the character it spells.
+    packages: HashMap<String, (String, bool, bool)>,
+    /// Every user-level name the kernel or a common package defines, and
+    /// which (`defined.tsv`).
+    defined: HashMap<String, String>,
+    /// unicode-math's own names, before the curated table gives some of
+    /// them another character (`blacktriangleright` is U+25B6 there).
+    unicode_math_names: HashMap<String, Atom>,
 }
 
 impl Table {
@@ -69,12 +77,23 @@ impl Table {
             info: HashMap::new(),
             greek_names: HashMap::new(),
             packages: HashMap::new(),
+            defined: HashMap::new(),
+            unicode_math_names: HashMap::new(),
         };
+        for row in Self::rows(DEFINED) {
+            if let [name, by] = row[..] {
+                t.defined.insert(name.to_string(), by.trim().to_string());
+            }
+        }
         for row in Self::rows(PACKAGES) {
-            if let [name, package, unicode_math] = row[..] {
+            if let [name, package, unicode_math, glyph] = row[..] {
                 t.packages.insert(
                     name.to_string(),
-                    (package.to_string(), unicode_math.trim() == "yes"),
+                    (
+                        package.to_string(),
+                        unicode_math.trim() == "yes",
+                        glyph.trim() != "differs",
+                    ),
                 );
             }
         }
@@ -120,6 +139,7 @@ impl Table {
             let atom = Atom::Named(cp);
             self.by_char.entry(cp).or_insert(atom);
             self.codepoint.entry(atom).or_insert(cp);
+            self.unicode_math_names.entry(name.clone()).or_insert(atom);
             self.by_name.entry(name).or_insert(atom);
         }
     }
@@ -211,6 +231,18 @@ impl Table {
                 self.by_name.insert(a.clone(), atom);
                 entry.aliases.push(a);
             }
+            for name in row
+                .get(3)
+                .into_iter()
+                .flat_map(|s| s.split(','))
+                .map(|a| a.trim().trim_start_matches('\\'))
+                .filter(|a| !a.is_empty())
+            {
+                if self.by_name.get(name) == Some(&atom) {
+                    self.by_name.remove(name);
+                }
+                entry.aliases.retain(|a| a != name);
+            }
         }
     }
 
@@ -223,6 +255,18 @@ impl Table {
     /// `in`, `alpha`, `|`).
     pub fn atom_of_name(&self, name: &str) -> Option<Atom> {
         self.by_name.get(name).copied()
+    }
+
+    /// The atom a name stands for in a document that loads unicode-math:
+    /// unicode-math's own reading where it draws the name as another glyph
+    /// than the curated table's (`\blacktriangleright` is ▶ there, ▸ under
+    /// amssymb), none where it has no character for it (`\bullet`), else
+    /// the usual one.
+    pub fn atom_of_name_under_unicode_math(&self, name: &str) -> Option<Atom> {
+        if self.same_glyph_in_unicode_math(name) {
+            return self.atom_of_name(name);
+        }
+        self.unicode_math_names.get(name).copied()
     }
 
     /// The character for an atom, if Unicode has one.
@@ -247,13 +291,22 @@ impl Table {
     /// a package, or `-` for none the generator tried; `None` when it has
     /// no row.
     pub fn defined_by(&self, command: &str) -> Option<&str> {
-        self.packages.get(command).map(|(p, _)| p.as_str())
+        self.packages.get(command).map(|(p, _, _)| p.as_str())
     }
 
     /// Does lualatex with unicode-math define this command? A command the
     /// table does not know (a user's macro) is taken to exist.
     pub fn in_unicode_math(&self, command: &str) -> bool {
-        self.packages.get(command).map_or(true, |(_, um)| *um)
+        self.packages.get(command).map_or(true, |(_, um, _)| *um)
+    }
+
+    /// Does this command draw, under unicode-math, the glyph of the
+    /// character it spells? (`\blacktriangleright` there is the large
+    /// triangle, not ▸.) A command the table does not know is taken to.
+    pub fn same_glyph_in_unicode_math(&self, command: &str) -> bool {
+        self.packages
+            .get(command)
+            .map_or(true, |(_, um, same)| *um && *same)
     }
 
     /// unicode-math's own name for an atom's character (`mdlgwhtsquare`),
@@ -261,6 +314,13 @@ impl Table {
     pub fn unicode_math_name(&self, atom: &Atom) -> Option<&str> {
         let cp = self.char_of(atom)?;
         self.info.get(&cp).and_then(|i| i.name.as_deref())
+    }
+
+    /// Who defines a name before any document does: `kernel`, or the
+    /// package that adds it (`implies` → `amsmath`); `None` for a name none
+    /// of the common packages defines.
+    pub fn predefined_by(&self, name: &str) -> Option<&str> {
+        self.defined.get(name).map(String::as_str)
     }
 
     /// True when the atom is a plain Greek letter LaTeX can name.
@@ -403,6 +463,17 @@ mod tests {
         );
         assert_eq!(t.atom_of_name("napprox"), Some(Atom::Named('≉')));
         assert_eq!(t.atom_of_name("blacktriangleright"), Some(Atom::Named('▸')));
+        assert!(!t.same_glyph_in_unicode_math("blacktriangleright"));
+        assert!(t.same_glyph_in_unicode_math("in"));
+        assert_eq!(t.latex_of(&Atom::Named('⧫')), Some("\\blacklozenge"));
+        assert_eq!(t.latex_of(&Atom::Named('◆')), None);
+        // The character ′ is the superscript prime `'` writes; \prime is
+        // the unraised glyph, another thing.
+        assert_eq!(t.latex_of(&Atom::Named('′')), Some("'"));
+        assert_eq!(t.latex_of(&Atom::Named('″')), Some("''"));
+        assert_eq!(t.atom_of_name("prime"), None);
+        assert_eq!(t.atom_of_name("backprime"), None);
+        assert_eq!(t.latex_of(&Atom::Named('‵')), None);
         // a symbol unicode-math knows but LaTeX has no name for
         assert_eq!(t.atom_of_char('∆'), Some(Atom::Named('∆')));
         assert_eq!(t.latex_of(&Atom::Named('∆')), None);

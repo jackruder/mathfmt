@@ -313,12 +313,18 @@ impl Loader<'_> {
 
     /// The group for files near `near`, under `root` when the caller names
     /// one, else `--root`, else the config's `root`, else none.
-    fn group(&mut self, near: &Path, root: Option<&Path>) -> Result<usize> {
+    fn group(
+        &mut self,
+        near: &Path,
+        root: Option<&Path>,
+        fallback: Option<&Path>,
+    ) -> Result<usize> {
         let (config_path, config) = locate_config(self.select.config.as_deref(), near)?;
         let root = root
             .map(Path::to_path_buf)
             .or_else(|| self.select.root.clone())
-            .or_else(|| config.root_path().map(|p| self.pretty(&p)));
+            .or_else(|| config.root_path().map(|p| self.pretty(&p)))
+            .or_else(|| fallback.map(Path::to_path_buf));
         let key = (config_path, root.clone());
         if let Some(&g) = self.index.get(&key) {
             return Ok(g);
@@ -383,7 +389,7 @@ fn load(select: &Select) -> Result<Loaded> {
         let mut taken: BTreeSet<PathBuf> = BTreeSet::new();
         for root in roots {
             let near = loader.near(&root);
-            let g = loader.group(&near, Some(&root))?;
+            let g = loader.group(&near, Some(&root), None)?;
             let files = loader.groups[g]
                 .engine
                 .project
@@ -406,7 +412,7 @@ fn load(select: &Select) -> Result<Loaded> {
             .read_to_string(&mut text)
             .context("reading stdin")?;
         let near = loader.cwd.clone();
-        let g = loader.group(&near, None)?;
+        let g = loader.group(&near, None, None)?;
         loader.groups[g].indices.push(0);
         group_of.push(g);
         inputs.push(Input { path: None, text });
@@ -416,12 +422,24 @@ fn load(select: &Select) -> Result<Loaded> {
         }
         for (i, p) in select.files.iter().enumerate() {
             let near = loader.near(p);
-            // A document named on its own is its own root: its preamble
-            // decides the engine and the commands, as under --project.
-            let own_root = (select.root.is_none()
-                && mathfmt_core::project::is_document(&inputs[i].text))
-            .then(|| p.clone());
-            let g = loader.group(&near, own_root.as_deref())?;
+            // With no root in force (no --root, none in the config), a
+            // document named on its own is its own root, and a subfile's
+            // is the main document it names: their preamble decides the
+            // engine and the commands, as under --project.
+            let text = &inputs[i].text;
+            let fallback = match mathfmt_core::project::subfile_main(text) {
+                Some(main) => {
+                    let base = p.parent().map(Path::to_path_buf).unwrap_or_default();
+                    let main = base.join(&main);
+                    Some(if main.extension().is_some() {
+                        main
+                    } else {
+                        main.with_extension("tex")
+                    })
+                }
+                None => mathfmt_core::project::is_document(text).then(|| p.clone()),
+            };
+            let g = loader.group(&near, None, fallback.as_deref())?;
             loader.groups[g].indices.push(i);
             group_of.push(g);
         }
@@ -570,7 +588,6 @@ fn convert(args: RunArgs, rename: Option<(String, String)>) -> Result<ExitCode> 
                     engine: &group.engine,
                     profile: &group.profile,
                     program: group.engine.program(),
-                    project: args.select.project.then_some(group_of[i]),
                     is_root: !args.select.project
                         || group
                             .engine

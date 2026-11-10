@@ -553,3 +553,96 @@ fn options_before_a_subcommand_are_refused() {
         "{out}"
     );
 }
+
+#[test]
+fn the_preamble_not_the_engine_decides_the_commands() {
+    let dir = temp_dir("fontspec");
+    write_tree(
+        &dir,
+        &[
+            (
+                "fs.tex",
+                "\\documentclass{article}\n\\usepackage{fontspec}\n\\usepackage{amssymb}\n\\begin{document}\n$𝐱 ∈ ℝ$\n\\end{document}\n",
+            ),
+            (
+                "um.tex",
+                "\\documentclass{article}\n\\usepackage{unicode-math}\n\\begin{document}\n$𝐱 ∈ ℝ, □$\n\\end{document}\n",
+            ),
+        ],
+    );
+    let (code, out, err) = run_in(&dir, &["-p", "ascii", "fs.tex"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("$\\mathbf{x} \\in \\mathbb{R}$"),
+        "lualatex without unicode-math:\n{out}"
+    );
+    let (_, out, _) = run_in(&dir, &["declarations", "fs.tex"]);
+    assert!(out.contains("\\usepackage{unicode-math-input}"), "{out}");
+    // A config that says how Unicode is read does not change what the
+    // preamble's package means for the commands.
+    fs::write(
+        dir.join("mathfmt.toml"),
+        "unicode_input = \"unicode-math-input\"\n",
+    )
+    .unwrap();
+    let (_, out, _) = run_in(&dir, &["-p", "ascii", "um.tex"]);
+    assert!(
+        out.contains("$\\symbf{x} \\in \\symbb{R}, \\mdlgwhtsquare$"),
+        "{out}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_root_in_force_beats_a_files_own_class() {
+    let dir = temp_dir("root-wins");
+    write_tree(
+        &dir,
+        &[
+            (
+                "main.tex",
+                "\\documentclass{article}\n\\usepackage{unicode-math}\n\\newcommand{\\R}{\\mathbb{R}}\n\\begin{document}\n\\subfile{sections/intro}\n\\end{document}\n",
+            ),
+            (
+                "sections/intro.tex",
+                "\\documentclass[../main.tex]{subfiles}\n\\begin{document}\n$x \\in \\R$, $□$\n\\end{document}\n",
+            ),
+            ("notes.tex", "Write \\verb|\\documentclass{article}| first. $x \\in \\R$\n"),
+        ],
+    );
+    let want = "$x \\in \\symbb{R}$, $\\mdlgwhtsquare$";
+    // No root anywhere: the subfile's own main is its root.
+    let (code, out, err) = run_in(&dir, &["-p", "ascii", "sections/intro.tex"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(want), "{out}");
+    // A config root wins over the file's class, and `\\verb` makes no document.
+    fs::write(dir.join("mathfmt.toml"), "root = \"main.tex\"\n").unwrap();
+    let (_, out, _) = run_in(&dir, &["-p", "ascii", "sections/intro.tex"]);
+    assert!(out.contains(want), "{out}");
+    let (_, out, _) = run_in(&dir, &["notes.tex"]);
+    assert!(
+        out.contains("$x ∈ ℝ$"),
+        "the root's \\R reaches a file that only mentions \\documentclass:\n{out}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_command_the_preamble_does_not_provide_is_a_warning() {
+    let dir = temp_dir("not-loaded");
+    write_tree(
+        &dir,
+        &[(
+            "main.tex",
+            "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n$ℝ + 𝟙$\n\\end{document}\n",
+        )],
+    );
+    let (code, _, err) = run_in(&dir, &["-p", "ascii", "--strict", "main.tex"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("warning[package-not-loaded]: writes \\mathbb, which needs amsfonts"),
+        "{err}"
+    );
+    assert!(err.contains("writes \\mathbbm, which needs bbm"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -700,6 +700,7 @@ impl<'a> Parser<'a> {
             opaque: opaque_reason(&body),
             body,
             kind: MacroKind::Command,
+            provided: provide,
         });
         true
     }
@@ -722,6 +723,7 @@ impl<'a> Parser<'a> {
             body: b.text(self.src).to_string(),
             kind: MacroKind::Operator,
             opaque: None,
+            provided: false,
         });
         true
     }
@@ -770,6 +772,7 @@ impl<'a> Parser<'a> {
             body,
             kind: MacroKind::Command,
             opaque,
+            provided: false,
         });
         true
     }
@@ -838,6 +841,7 @@ impl<'a> Parser<'a> {
             body,
             kind: MacroKind::Command,
             opaque,
+            provided: provide,
         });
         true
     }
@@ -975,7 +979,14 @@ impl<'a> Parser<'a> {
     }
 
     fn signature_for(&self, name: &str) -> Signature {
-        if let Some(m) = self.local.get(name).or_else(|| self.base.get(name)) {
+        let user = self
+            .local
+            .get(name)
+            .or_else(|| self.base.get(name))
+            // A provided macro over a command the signatures know never
+            // took effect; the command's own signature applies.
+            .filter(|m| !(m.provided && self.sigs.get(name).is_some()));
+        if let Some(m) = user {
             return match m.kind {
                 MacroKind::Operator => Signature::none(),
                 MacroKind::Command => {
@@ -1242,6 +1253,7 @@ mod tests {
             &MacroTable::new(),
         );
         assert_eq!(fresh.macros.get("R").unwrap().body, "\\mathbf{R}");
+        assert!(fresh.macros.get("R").unwrap().provided);
     }
 
     #[test]

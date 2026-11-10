@@ -1,0 +1,7 @@
+% packages the notation's commands need and the preamble does not load
+\usepackage{unicode-math-input}
+% Unicode math input: each character means what the profile spells it as (unicode-math-input's own table lacks some and reads others differently)
+\umiDeclareMathChar{ℝ}{\mathbb{R}}
+\umiDeclareMathChar{𝕜}{\mathbb{k}}
+\umiDeclareMathChar{𝕩}{\mathbb{x}}
+\umiDeclareMathChar{𝟙}{\mathbb{1}}

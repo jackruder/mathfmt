@@ -1,9 +1,12 @@
-# codepoint	latex	aliases
+# codepoint	latex	aliases	not-aliases
 # Hand-curated. `latex` is the spelling the `latex` profile emits and must be
 # defined by the LaTeX kernel, amsmath, amssymb or bm. `aliases` are extra input
 # names (comma-separated) beyond the unicode-math primary name, which is always
 # accepted. A row with an empty `latex` column accepts its aliases on input but
-# has no ASCII spelling. Greek letters live in greek.tsv; styled letters in
+# has no ASCII spelling. `not-aliases` are names that must not read as this
+# character although unicode-math's table gives them to it: `\prime` is the
+# unraised prime glyph, while the character ′ is the superscript prime that
+# `'` writes. Greek letters live in greek.tsv; styled letters in
 # alphabets.tsv. Add a symbol here, not in code.
 #
 # relations
@@ -306,8 +309,10 @@
 2220	\angle	
 2221	\measuredangle	
 2222	\sphericalangle	
-2032	\prime	
-2035	\backprime	
+2032	'		\prime
+2033	''		\dprime
+2034	'''		\trprime
+2035			\backprime
 266D	\flat	
 266E	\natural	
 266F	\sharp	
@@ -319,7 +324,7 @@
 25A1	\square	\Box
 25A0	\blacksquare	
 25CA	\lozenge	\Diamond
-25C6	\blacklozenge	
+29EB	\blacklozenge	
 25CB	\bigcirc	
 25B4	\blacktriangle	
 25BE	\blacktriangledown	

@@ -143,6 +143,8 @@
                   doublestroke
                   # a test's document uses the subfiles class
                   subfiles
+                  # the bbold project case
+                  bbold
                   # the unicode-math project case compiles with lualatex
                   unicode-math
                   fontspec

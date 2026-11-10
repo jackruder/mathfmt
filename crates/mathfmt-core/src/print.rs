@@ -323,15 +323,42 @@ fn spell_one(atom: &Atom, profile: &Profile, table: &Table) -> Result<Piece, Ato
         return Ok(Piece::Plain(s.to_string()));
     }
     // The curated command spelling, where the document's package family
-    // defines it. unicode-math replaces amssymb and lacks a few of its
-    // names (`\square`, `\leadsto`); there its own name for the character
-    // (`\mdlgwhtsquare`) is the spelling that exists.
+    // defines it and draws the character with it. unicode-math replaces
+    // amssymb, lacks a few of its names (`\square`, `\leadsto`) and points
+    // a few others at another glyph (`\blacktriangleright` is the large
+    // triangle there); its own name for the character (`\mdlgwhtsquare`,
+    // `\smallblacktriangleright`) is the spelling that is faithful.
     let command_spelling = |atom: &Atom| -> Option<String> {
-        let curated = table.latex_of(atom)?;
+        let Some(curated) = table.latex_of(atom) else {
+            // unicode-math names every character it has.
+            return (profile.preset == StylePreset::UnicodeMath && matches!(atom, Atom::Named(_)))
+                .then(|| table.unicode_math_name(atom).map(|n| format!("\\{n}")))
+                .flatten();
+        };
+        // With lowercase and digits in the profile's own blackboard command
+        // (bbold, mathbbol), amssymb's `\Bbbk` is another font's letter.
+        if let Atom::Styled {
+            style: Style::Bb,
+            base,
+        } = atom
+        {
+            let bb = profile.style_commands.get("bb");
+            let key = if base.is_ascii_digit() {
+                "bb_digit"
+            } else {
+                "bb_lower"
+            };
+            if (base.is_ascii_lowercase() || base.is_ascii_digit())
+                && bb.is_some()
+                && profile.style_commands.get(key) == bb
+            {
+                return None;
+            }
+        }
         let exists = profile.preset != StylePreset::UnicodeMath
             || crate::declare::control_words(curated)
                 .iter()
-                .all(|w| table.in_unicode_math(w));
+                .all(|w| table.same_glyph_in_unicode_math(w));
         if exists {
             Some(curated.to_string())
         } else {
@@ -411,21 +438,29 @@ fn starts_alphabetic(s: &str) -> bool {
 
 /// Is the last thing before an occurrence a script operator (`^`, `_`,
 /// `\sp`, `\sb`), with any whitespace, newlines and comments between, so
-/// the occurrence is the operand of a script? The lines before are lexed
-/// from their start, since only that tells a comment from code.
+/// the occurrence is the operand of a script?
 pub(crate) fn is_script_operand(before: &str) -> bool {
     let mut end = before.trim_end().len();
     loop {
         let start = before[..end].rfind('\n').map_or(0, |i| i + 1);
         let line = &before[start..end];
-        if let Some(t) = crate::lex::lex_all(line)
-            .into_iter()
-            .rev()
-            .find(|t| t.kind != TokKind::Trivia)
-        {
-            return match t.kind {
+        // Only a `%` can make the end of a line a comment; without one the
+        // last token is read off the end, which keeps a long line linear.
+        let last = if line.contains('%') {
+            crate::lex::lex_all(line)
+                .into_iter()
+                .rev()
+                .find(|t| t.kind != TokKind::Trivia)
+                .map(|t| (t.kind, t.span.start))
+        } else {
+            last_token(line)
+        };
+        if let Some((kind, at)) = last {
+            return match kind {
                 TokKind::Sup | TokKind::Sub => true,
-                TokKind::ControlWord => matches!(t.name(line), "sp" | "sb"),
+                TokKind::ControlWord => {
+                    matches!(&line[at + 1..].trim_end(), &("sp" | "sb"))
+                }
                 _ => false,
             };
         }
@@ -434,6 +469,44 @@ pub(crate) fn is_script_operand(before: &str) -> bool {
         }
         end = before[..start].trim_end().len();
     }
+}
+
+/// The kind and start of the last token of a line holding no comment.
+fn last_token(line: &str) -> Option<(TokKind, usize)> {
+    let line = line.trim_end();
+    if line.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    // A trailing run of letters after an odd number of backslashes is a
+    // control word; one character after a backslash a control symbol.
+    let letters = bytes
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let at = bytes.len() - letters;
+    let slashes = |end: usize| {
+        bytes[..end]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+    };
+    if letters > 0 && at > 0 && slashes(at) % 2 == 1 {
+        return Some((TokKind::ControlWord, at - 1));
+    }
+    let c = line.chars().next_back()?;
+    let at = line.len() - c.len_utf8();
+    if at > 0 && slashes(at) % 2 == 1 {
+        return Some((TokKind::ControlSymbol, at - 1));
+    }
+    let kind = match c {
+        '^' => TokKind::Sup,
+        '_' => TokKind::Sub,
+        _ => TokKind::Char,
+    };
+    Some((kind, at))
 }
 
 /// A script operand that is a multi-byte character (pdflatex reads it a byte
@@ -489,6 +562,9 @@ fn followed_by_script(after: &str) -> bool {
         match t.kind {
             TokKind::Trivia => pos = t.span.end,
             TokKind::Sup | TokKind::Sub => return true,
+            // `\relax` and `\space` make no atom: a script after them
+            // still attaches to what came before.
+            TokKind::ControlWord if matches!(t.name(after), "relax" | "space") => pos = t.span.end,
             TokKind::ControlWord => return matches!(t.name(after), "sp" | "sb"),
             TokKind::Char => {
                 return matches!(t.ch(after), '\'' | '′' | '″' | '‴' | '⁗');
@@ -600,8 +676,8 @@ mod tests {
             "unicode",
         );
         assert_eq!(
-            u,
-            "${𝐱^{𝟐}}\\sp3 + {𝐱_{𝟏}}\\sb2 + {𝐱^{𝟐}}′ + {𝐱^{𝟐}}% c\n^3 + {𝐱^{𝟐}}\n'$"
+            u, "${𝐱^{𝟐}}\\sp3 + {𝐱_{𝟏}}\\sb2 + {𝐱^{𝟐}}' + {𝐱^{𝟐}}% c\n^3 + {𝐱^{𝟐}}\n'$",
+            "the prime character is the `'` it means, in every profile"
         );
         assert!(is_script_operand("x^"));
         assert!(is_script_operand("x_ "));
@@ -613,6 +689,15 @@ mod tests {
         assert!(!is_script_operand("x^y "));
         assert!(!is_script_operand("% x^\n"));
         assert!(followed_by_script("\\sp3"));
+        assert!(followed_by_script("\\relax^3"));
+        assert!(followed_by_script("\\space ^3"));
+        assert!(
+            !is_script_operand("x\\^"),
+            "an escaped caret is a character"
+        );
+        assert!(!is_script_operand("x\\_"));
+        assert!(is_script_operand("x\\\\^"), "after a line break, a caret");
+        assert!(!is_script_operand("x\\spy"), "\\spy is another word");
         assert!(followed_by_script("% c\n^3"));
         assert!(followed_by_script(" ′"));
         assert!(!followed_by_script(" + 1"));

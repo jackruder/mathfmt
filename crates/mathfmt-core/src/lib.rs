@@ -181,6 +181,42 @@ impl Engine {
     pub fn add_macro_source(&mut self, text: &str) {
         let doc = scan(text, &self.signatures, &self.scan_options, &self.macros);
         self.macros = doc.macros;
+        let mut macros = std::mem::take(&mut self.macros);
+        self.drop_ineffective_provides(&mut macros);
+        self.macros = macros;
+    }
+
+    /// Scan a file and drop the `\providecommand`s that did nothing.
+    fn scan(&self, src: &str) -> Document {
+        let mut document = scan(src, &self.signatures, &self.scan_options, &self.macros);
+        self.drop_ineffective_provides(&mut document.macros);
+        document
+    }
+
+    /// A `\providecommand` defines a name only if nothing did before. The
+    /// macro tables already keep an earlier user definition; this drops one
+    /// whose name the kernel or a loaded package defines (`\implies` under
+    /// amsmath), or a symbol or command the tables know. Without a root the
+    /// preamble is taken to load amsmath and amssymb, as the `ascii`
+    /// profile assumes.
+    fn drop_ineffective_provides(&self, macros: &mut MacroTable) {
+        let loads = |package: &str| match &self.project {
+            Some(p) if p.class.is_some() => p.loads(package),
+            _ => matches!(package, "amsmath" | "amsfonts" | "amssymb"),
+        };
+        macros.retain(|m| {
+            if !m.provided {
+                return true;
+            }
+            let predefined = match self.table.predefined_by(&m.name) {
+                Some("kernel") => true,
+                Some(package) => loads(package),
+                None => false,
+            };
+            !(predefined
+                || self.table.atom_of_name(&m.name).is_some()
+                || self.signatures.get(&m.name).is_some())
+        });
     }
 
     /// The profile to use: `name`, else the config's default. A profile
@@ -189,13 +225,47 @@ impl Engine {
     /// loads it, or the engine is not pdflatex): the same rule the
     /// declarations follow, so the two never disagree.
     pub fn profile(&self, name: Option<&str>) -> Result<Profile, Error> {
-        let preset = match self.mechanism() {
-            Mechanism::UnicodeMath => StylePreset::UnicodeMath,
-            _ => StylePreset::Latex,
+        let preset = if self.loads_unicode_math() {
+            StylePreset::UnicodeMath
+        } else {
+            StylePreset::Latex
         };
-        Ok(self
-            .config
-            .profile_with(name.unwrap_or(self.config.default_profile_name()), preset)?)
+        let name = name.unwrap_or(self.config.default_profile_name());
+        let mut profile = self.config.profile_with(name, preset)?;
+        // bbold and mathbbol give `\mathbb` lowercase and digits, where
+        // amsfonts has neither and bbm's `\mathbbm` stands in; with one of
+        // them loaded, `\mathbbm` may not exist and `\mathbb` is right.
+        let full_bb = self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.loads("bbold") || p.loads("mathbbol"));
+        let user = self.config.profiles.get(name);
+        if full_bb {
+            let bb = profile
+                .style_commands
+                .get("bb")
+                .cloned()
+                .unwrap_or_default();
+            for key in ["bb_digit", "bb_lower"] {
+                if !user.is_some_and(|u| u.style_commands.contains_key(key)) {
+                    profile.style_commands.insert(key.to_string(), bb.clone());
+                }
+            }
+        }
+        Ok(profile)
+    }
+
+    /// Does the document read math through unicode-math? With a root, when
+    /// its preamble loads the package; without one, when the engine is not
+    /// pdflatex, since that is what `--verify`'s own snippet preamble for
+    /// lualatex and xelatex loads. The engine alone never decides it for a
+    /// document: a lualatex document with fontspec and no unicode-math
+    /// has `\mathbf` and `\mathbb` as pdflatex has them.
+    pub fn loads_unicode_math(&self) -> bool {
+        match &self.project {
+            Some(p) if p.class.is_some() => p.loads("unicode-math"),
+            _ => !matches!(self.program().as_str(), "pdflatex" | "latex"),
+        }
     }
 
     /// The program that compiles the document: the config's `engine`, else
@@ -209,17 +279,14 @@ impl Engine {
     }
 
     /// How the document reads Unicode math: the config's `unicode_input`,
-    /// else `unicode-math` when the preamble loads it or the engine is not
-    /// pdflatex, else `unicode-math-input`.
+    /// else `unicode-math` when it loads that package
+    /// ([`Engine::loads_unicode_math`]), else `unicode-math-input`, which
+    /// works under pdflatex and under lualatex without unicode-math alike.
     pub fn mechanism(&self) -> Mechanism {
         if let Some(m) = self.config.unicode_input {
             return m;
         }
-        let unicode_math = self
-            .project
-            .as_ref()
-            .is_some_and(|p| p.loads("unicode-math"));
-        if unicode_math || !matches!(self.program().as_str(), "pdflatex" | "latex") {
+        if self.loads_unicode_math() {
             Mechanism::UnicodeMath
         } else {
             Mechanism::UnicodeMathInput
@@ -310,7 +377,17 @@ impl Engine {
                         .into_iter()
                         .filter(|w| self.table.defined_by(w) == Some("-"))
                         .collect();
-                    if !unavailable.is_empty() {
+                    if mechanism == Mechanism::Kernel && s.chars().all(|c| c == '\'') {
+                        // A declared prime is a group to TeX, so a script
+                        // after it (`f′^2`) is a double superscript; only
+                        // unicode-math-input reads it as `'`.
+                        undeclared.push((
+                            c,
+                            format!(
+                                "the kernel's mechanism cannot make it the `{s}` it means before a script; write `{s}`, or use unicode-math-input"
+                            ),
+                        ));
+                    } else if !unavailable.is_empty() {
                         undeclared.push((
                             c,
                             format!(
@@ -373,7 +450,7 @@ impl Engine {
 
     /// Convert one file's text.
     pub fn convert(&self, src: &str, profile: &Profile, rename: &RenameMap) -> Outcome {
-        let document = scan(src, &self.signatures, &self.scan_options, &self.macros);
+        let document = self.scan(src);
         let mut diagnostics = document.diagnostics.clone();
         let decls = self.config.notation_decls();
         let notations = notation::parse_notations(&decls, &self.signatures, &document.macros);
@@ -409,6 +486,7 @@ impl Engine {
             })
             .collect();
         drop(matches);
+        diagnostics.extend(self.unloaded_packages(&edits, profile));
         let output = print::apply(src, &edits);
         diagnostics.sort_by_key(|d| d.offset);
         Outcome {
@@ -420,6 +498,45 @@ impl Engine {
             document,
             diagnostics,
         }
+    }
+
+    /// A warning for each command the edits write that the known preamble
+    /// does not provide: a package it does not load, or under unicode-math
+    /// a name that package lacks. Without a root nothing is known and
+    /// nothing is said. A package the reader does not know the contents of
+    /// (`newtxmath`) may provide the command after all; the message says so.
+    fn unloaded_packages(&self, edits: &[Edit], profile: &Profile) -> Vec<Diagnostic> {
+        let Some(project) = self.project.as_ref().filter(|p| p.class.is_some()) else {
+            return Vec::new();
+        };
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut out = Vec::new();
+        for e in edits {
+            for word in declare::control_words(&e.replacement) {
+                let missing = if profile.preset == StylePreset::UnicodeMath {
+                    (!self.table.in_unicode_math(&word)).then(|| "unicode-math".to_string())
+                } else {
+                    match self.table.package_of(&word) {
+                        Some("-") => Some("a package pdflatex can load".to_string()),
+                        Some(p) if !project.loads(p) => Some(p.to_string()),
+                        _ => None,
+                    }
+                };
+                if let Some(package) = missing {
+                    if seen.insert(word.clone()) {
+                        out.push(Diagnostic::warning(
+                            "package-not-loaded",
+                            e.span.start,
+                            format!(
+                                "writes \\{word}, which needs {package}, and the preamble of {} does not load it (unless a package mathfmt does not know provides it); `mathfmt declarations` lists what to add",
+                                project.root.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Convert a rendered notation form (math only, no notations) so its
@@ -473,7 +590,7 @@ impl Engine {
 
     /// The notation inventory of one file: each atom, how often, spelled how.
     pub fn inventory(&self, src: &str, profile: &Profile) -> Vec<SymbolCount> {
-        let document = scan(src, &self.signatures, &self.scan_options, &self.macros);
+        let document = self.scan(src);
         let (occurrences, _, _) =
             resolve::resolve(&document, src, &self.table, &self.signatures, profile, &[]);
         let mut map: BTreeMap<Atom, SymbolCount> = BTreeMap::new();
@@ -502,7 +619,7 @@ impl Engine {
     /// to exactly one atom.
     pub fn parse_atom(&self, spelling: &str, profile: &Profile) -> Result<Atom, Error> {
         let src = format!("${spelling}$");
-        let document = scan(&src, &self.signatures, &self.scan_options, &self.macros);
+        let document = self.scan(&src);
         let (occurrences, _, _) =
             resolve::resolve(&document, &src, &self.table, &self.signatures, profile, &[]);
         let atoms: Vec<Atom> = occurrences.into_iter().flat_map(|o| o.atoms).collect();
@@ -817,6 +934,19 @@ mod tests {
                 )
                 .output,
             r"$\bk{a}{{-x}} + \E{x \sim p}{f}$"
+        );
+    }
+
+    #[test]
+    fn a_provided_command_the_kernel_or_a_package_defines_does_not_take_effect() {
+        let engine = Engine::new(Config::default()).unwrap();
+        let p = engine.profile(None).unwrap();
+        let none = RenameMap::new();
+        let defs = "\\providecommand{\\implies}{\\Rightarrow}\\providecommand{\\R}{\\mathbb{R}}\n";
+        assert_eq!(
+            engine.convert(&format!("{defs}$a \\implies b \\in \\R$"), &p, &none).output,
+            format!("{defs}$a \\implies b ∈ ℝ$"),
+            "amsmath's \\implies (a spaced ⟹, no one symbol) stands; a name nothing defined is provided"
         );
     }
 

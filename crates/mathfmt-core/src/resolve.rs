@@ -1,7 +1,7 @@
 //! From a math tree to atoms (design §8).
 
 use crate::atom::{is_greek, Atom, Style};
-use crate::config::Profile;
+use crate::config::{Profile, StylePreset};
 use crate::diag::Diagnostic;
 use crate::lex::{Span, TokKind, Token};
 use crate::macros::{substitute, Macro, MacroKind, MacroTable};
@@ -201,6 +201,15 @@ impl<'a, 'n> Resolver<'a, 'n> {
         complete
     }
 
+    /// The atom a name reads as, in the document's package family.
+    fn atom_of_name(&self, name: &str) -> Option<Atom> {
+        if self.profile.preset == StylePreset::UnicodeMath {
+            self.table.atom_of_name_under_unicode_math(name)
+        } else {
+            self.table.atom_of_name(name)
+        }
+    }
+
     fn leaf(&mut self, t: &Token, out: &mut Vec<Occurrence>) -> bool {
         match t.kind {
             TokKind::Trivia => true,
@@ -225,7 +234,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
                 false
             }
             TokKind::ControlWord | TokKind::ControlSymbol => {
-                if let Some(atom) = self.table.atom_of_name(t.name(self.src)) {
+                if let Some(atom) = self.atom_of_name(t.name(self.src)) {
                     out.push(Occurrence {
                         span: t.span,
                         atoms: vec![atom],
@@ -290,7 +299,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
             return complete && transparent;
         }
         if c.args.is_empty() {
-            if let Some(atom) = self.table.atom_of_name(name) {
+            if let Some(atom) = self.atom_of_name(name) {
                 out.push(Occurrence {
                     span: c.name.span,
                     atoms: vec![atom],
@@ -322,7 +331,7 @@ impl<'a, 'n> Resolver<'a, 'n> {
                 }
             }
             Node::Command(c) if c.args.is_empty() => {
-                match self.table.atom_of_name(c.name.name(self.src)) {
+                match self.atom_of_name(c.name.name(self.src)) {
                     Some(Atom::Named(n)) if is_greek(n) || n == '∇' || n == '∂' => Some(n),
                     _ => None,
                 }

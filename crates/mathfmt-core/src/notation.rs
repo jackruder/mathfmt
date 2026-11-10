@@ -511,7 +511,12 @@ impl<'a> Matcher<'a> {
         let end = g.close.map(|c| c.span.start).unwrap_or(start).max(start);
         let text = &self.doc_src[start..end];
         let lead = text.len() - text.trim_start().len();
-        let trail = text.len() - text.trim_end().len();
+        let mut trail = text.len() - text.trim_end().len();
+        // The space of a control space (`b\ `) is part of it.
+        let kept = text.trim_end();
+        if trail > 0 && kept.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 {
+            trail -= text[kept.len()..].chars().next().map_or(0, char::len_utf8);
+        }
         let span = Span::new(start + lead, (end - trail).max(start + lead));
         let Some(slot) = binds.get(h) else {
             return false;
@@ -687,7 +692,7 @@ pub fn rewrite(
                 // The hole's edits were planned in the source's context,
                 // where a leading or trailing space may have kept a control
                 // word apart from a letter; the seams here are the form's.
-                let mut text = apply_within(src, hole.span, &edits).trim().to_string();
+                let mut text = trim_hole(&apply_within(src, hole.span, &edits));
                 // A binding that was a script's braced operand brings braces
                 // that belonged to the script. Where the form supplies the
                 // grouping (`{#1}`, or a script whose operand is braced
@@ -741,6 +746,20 @@ pub fn rewrite(
     }
     edits.sort_by_key(|e| e.span.start);
     edits
+}
+
+/// A hole's text without the space around it, except the space of a
+/// control space: `b\ ` keeps its last space, or it would be `b\` and
+/// escape whatever follows.
+fn trim_hole(text: &str) -> String {
+    let start = text.trim_start();
+    let end = start.trim_end();
+    let slashes = end.bytes().rev().take_while(|&b| b == b'\\').count();
+    if slashes % 2 == 1 && end.len() < start.len() {
+        start[..end.len() + 1].replace('\n', " ")
+    } else {
+        end.to_string()
+    }
 }
 
 /// The index of the nearest token before `i` that is not trivia.
@@ -985,6 +1004,18 @@ mod tests {
             first_match(r"$\foo(a)$", two).map(|m| m.0),
             Some("one".into())
         );
+    }
+
+    #[test]
+    fn a_hole_keeps_the_space_of_a_control_space() {
+        assert_eq!(trim_hole("  b\\  "), "b\\ ");
+        assert_eq!(trim_hole("b\\\n"), "b\\ ");
+        assert_eq!(
+            trim_hole(" b\\\\ "),
+            "b\\\\",
+            "a line break is not an escape"
+        );
+        assert_eq!(trim_hole(" α "), "α");
     }
 
     #[test]

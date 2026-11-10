@@ -30,6 +30,10 @@ pub struct Macro {
     pub kind: MacroKind,
     /// Why this macro is never expanded, when it is not.
     pub opaque: Option<String>,
+    /// Defined by `\providecommand`: it stands only if nothing defined the
+    /// name before, which for a command of the kernel or a package (the
+    /// symbol table and the signatures know those) it did not.
+    pub provided: bool,
 }
 
 impl Macro {
@@ -41,6 +45,7 @@ impl Macro {
             body: body.to_string(),
             kind: MacroKind::Command,
             opaque: opaque_reason(body),
+            provided: false,
         }
     }
 
@@ -136,6 +141,11 @@ impl MacroTable {
     /// Definitions from `other` override this table's.
     pub fn extend(&mut self, other: MacroTable) {
         self.defs.extend(other.defs);
+    }
+
+    /// Keep only the definitions `keep` accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Macro) -> bool) {
+        self.defs.retain(|_, m| keep(m));
     }
 }
 

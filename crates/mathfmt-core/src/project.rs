@@ -160,33 +160,166 @@ pub fn code_part(line: &str) -> &str {
     line
 }
 
-/// Does this source carry its own `\documentclass`, outside comments and
-/// outside the verbatim environments that could show one?
-pub fn is_document(text: &str) -> bool {
-    let mut verbatim: Option<String> = None;
-    for line in text.lines() {
-        let code = code_part(line);
-        if let Some(env) = &verbatim {
-            if code.contains(&format!("\\end{{{env}}}")) {
-                verbatim = None;
+/// The text as TeX reads it for code: the same bytes, with comments, the
+/// bodies of verbatim environments and the arguments of `\verb` and
+/// `\lstinline` turned to spaces (newlines kept), so offsets still hold.
+pub fn live_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let blank = |out: &mut String, s: &str| {
+        for c in s.chars() {
+            if c == '\n' {
+                out.push('\n');
+            } else {
+                out.extend(std::iter::repeat(' ').take(c.len_utf8()));
             }
-            continue;
         }
-        if let Some(at) = code.find("\\begin{") {
-            let rest = &code[at + 7..];
-            if let Some(end) = rest.find('}') {
-                let env = &rest[..end];
-                if VERBATIM_ENVIRONMENTS.contains(&env) {
-                    verbatim = Some(env.to_string());
+    };
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < text.len() {
+        let rest = &text[i..];
+        match bytes[i] {
+            b'%' => {
+                let end = rest.find('\n').map_or(text.len(), |n| i + n);
+                blank(&mut out, &text[i..end]);
+                i = end;
+            }
+            b'\\' => {
+                let word_len = rest[1..]
+                    .bytes()
+                    .take_while(u8::is_ascii_alphabetic)
+                    .count();
+                let word = &rest[1..1 + word_len];
+                if word_len == 0 {
+                    // A control symbol: `\%` is not a comment, `\\` not an escape.
+                    let n = rest[1..].chars().next().map_or(0, char::len_utf8);
+                    out.push_str(&rest[..1 + n]);
+                    i += 1 + n;
                     continue;
                 }
+                out.push_str(&rest[..1 + word_len]);
+                i += 1 + word_len;
+                match word {
+                    "verb" | "lstinline" => {
+                        let mut j = i;
+                        if text[j..].starts_with('*') {
+                            out.push('*');
+                            j += 1;
+                        }
+                        // `\lstinline[opts]{…}` or a delimiter pair.
+                        if word == "lstinline" && text[j..].starts_with('[') {
+                            let close = text[j..].find(']').map_or(text.len(), |n| j + n + 1);
+                            out.push_str(&text[j..close]);
+                            j = close;
+                        }
+                        let Some(d) = text[j..].chars().next() else {
+                            i = j;
+                            continue;
+                        };
+                        let close_d = if d == '{' { '}' } else { d };
+                        let body = j + d.len_utf8();
+                        let end = text[body..]
+                            .find([close_d, '\n'])
+                            .map_or(text.len(), |n| body + n);
+                        out.push(d);
+                        blank(&mut out, &text[body..end]);
+                        if text[end..].starts_with(close_d) {
+                            out.push(close_d);
+                            i = end + close_d.len_utf8();
+                        } else {
+                            i = end;
+                        }
+                    }
+                    "begin" => {
+                        let after = &text[i..];
+                        let trimmed = after.trim_start_matches([' ', '\t']);
+                        let skip = after.len() - trimmed.len();
+                        let Some(env) = trimmed
+                            .strip_prefix('{')
+                            .and_then(|r| r.split_once('}'))
+                            .map(|(e, _)| e)
+                        else {
+                            continue;
+                        };
+                        if !VERBATIM_ENVIRONMENTS.contains(&env) {
+                            continue;
+                        }
+                        let open_end = i + skip + env.len() + 2;
+                        out.push_str(&text[i..open_end]);
+                        let end_tag = format!("\\end{{{env}}}");
+                        let close = text[open_end..]
+                            .find(&end_tag)
+                            .map_or(text.len(), |n| open_end + n);
+                        blank(&mut out, &text[open_end..close]);
+                        i = close;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                let c = rest.chars().next().expect("not at the end");
+                out.push(c);
+                i += c.len_utf8();
             }
         }
-        if code.contains("\\documentclass") {
-            return true;
-        }
     }
-    false
+    out
+}
+
+/// The offset of a control word `\name` in live text, not part of a longer
+/// word, from `from` on.
+fn find_word(live: &str, name: &str, from: usize) -> Option<usize> {
+    let needle = format!("\\{name}");
+    let mut at = from;
+    while let Some(n) = live[at..].find(&needle) {
+        let start = at + n;
+        let end = start + needle.len();
+        let slashes = live[..start]
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'\\')
+            .count();
+        let boundary = !live[end..].starts_with(|c: char| c.is_ascii_alphabetic());
+        if slashes % 2 == 0 && boundary {
+            return Some(start);
+        }
+        at = end;
+    }
+    None
+}
+
+/// Does this source carry its own `\documentclass`, outside comments,
+/// verbatim environments and `\verb`?
+pub fn is_document(text: &str) -> bool {
+    find_word(&live_text(text), "documentclass", 0).is_some()
+}
+
+/// The byte offset of the `\begin{document}` TeX acts on: outside comments
+/// (`\\%` starts one, `\%` does not) and verbatim, `\begin {document}`
+/// with a space included.
+pub fn begin_document(text: &str) -> Option<usize> {
+    let live = live_text(text);
+    let mut from = 0;
+    while let Some(at) = find_word(&live, "begin", from) {
+        let rest = live[at + 6..].trim_start_matches([' ', '\t']);
+        if rest.starts_with("{document}") {
+            return Some(at);
+        }
+        from = at + 6;
+    }
+    None
+}
+
+/// The main document a subfile names: `\documentclass[../main.tex]{subfiles}`.
+pub fn subfile_main(text: &str) -> Option<String> {
+    let live = live_text(text);
+    let at = find_word(&live, "documentclass", 0)?;
+    let rest = live[at + "\\documentclass".len()..].trim_start();
+    let option = rest.strip_prefix('[')?;
+    let (option, after) = option.split_once(']')?;
+    after.trim_start().strip_prefix("{subfiles}")?;
+    let option = option.trim();
+    plain_name(option).then(|| option.to_string())
 }
 
 /// Environments whose body TeX does not read as code.
@@ -384,13 +517,25 @@ impl Reader<'_> {
         if !plain_name(file) {
             return;
         }
-        let with_tex = base.join(format!("{file}.tex"));
-        let named = base.join(file);
-        let path = if with_tex.is_file() {
-            with_tex
-        } else if named.is_file() {
-            named
-        } else {
+        // TeX tries `file.tex`, then `file` (a name that ends in `.tex`
+        // is not extended again), in the import path, then from the root's
+        // directory, where TeX runs.
+        let mut bases = vec![base.to_path_buf()];
+        if base != self.project.dir {
+            bases.push(self.project.dir.clone());
+        }
+        let candidates: Vec<PathBuf> = bases
+            .iter()
+            .flat_map(|b| {
+                let mut c = Vec::new();
+                if !file.ends_with(".tex") {
+                    c.push(b.join(format!("{file}.tex")));
+                }
+                c.push(b.join(file));
+                c
+            })
+            .collect();
+        let Some(path) = candidates.into_iter().find(|p| p.is_file()) else {
             if !preamble && !self.project.missing.iter().any(|m| m == file) {
                 self.project.missing.push(file.to_string());
             }
@@ -668,6 +813,56 @@ mod tests {
             p.missing
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_import_falls_back_to_the_root_and_a_tex_name_is_not_extended() {
+        let dir = tree(
+            "fallback",
+            &[
+                (
+                    "main.tex",
+                    "\\documentclass{article}\\begin{document}\\import{parts/}{p}\\include{chap.tex}\\end{document}",
+                ),
+                ("parts/p.tex", "\\input{onlyroot} \\input{parts/both}"),
+                ("onlyroot.tex", "o"),
+                ("parts/both.tex", "b"),
+                ("chap.tex", "right"),
+                ("chap.tex.tex", "wrong"),
+            ],
+        );
+        let p = Project::read(&dir.join("main.tex")).unwrap();
+        assert_eq!(
+            names(&dir, &p.files),
+            [
+                "main.tex",
+                "parts/p.tex",
+                "onlyroot.tex",
+                "parts/both.tex",
+                "chap.tex"
+            ]
+        );
+        assert!(p.missing.is_empty(), "{:?}", p.missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_text_follows_tex() {
+        let one_line = "\\documentclass{article}\n\\begin{comment} \\begin{document} \\end{comment}\n\\begin{document}\n";
+        assert_eq!(
+            begin_document(one_line),
+            one_line.rfind("\\begin{document}")
+        );
+        assert!(!is_document(
+            "See \\verb|\\documentclass{article}| and \\lstinline{\\documentclass}.\n"
+        ));
+        assert!(!is_document("\\documentclassic{x}\n"), "another word");
+        assert_eq!(live_text("a % b\nc").len(), "a % b\nc".len());
+        assert_eq!(
+            subfile_main("\\documentclass[../main.tex]{subfiles}\n").as_deref(),
+            Some("../main.tex")
+        );
+        assert_eq!(subfile_main("\\documentclass[11pt]{article}\n"), None);
     }
 
     #[test]

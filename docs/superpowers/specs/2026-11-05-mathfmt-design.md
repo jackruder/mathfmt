@@ -922,7 +922,7 @@ lists them with what was done. The behaviour that changed:
 
 - **§11, `declarations` under unicode-math-input.** Every character is
   declared, not the styled letters alone. Measured: with every symbol of the
-  table declared, all 352 render identically to their commands under
+  table declared, all 356 render identically to their commands under
   pdflatex, delimiters after `\left`, `\middle` and `\bigl` included; left to
   the package's own table, ten do not compile (`↝`, `⊳`, `Ⓢ`, the black
   triangles) and six render otherwise (`√` as the radical, `∖`, `′`, `‵`,
@@ -1011,3 +1011,92 @@ lists them with what was done. The behaviour that changed:
   zero. A `\begin{document}` inside `\iffalse…\fi` is still taken as the
   real one. The paper's numbers in the README come from the author's own
   tree, which the reviewer could not read.
+
+### 2026-11-10, the fourth review
+
+An independent review of the third review's fixes (`5270bbd`) returned
+seventeen findings, five of them regressions of those fixes;
+`docs/REVIEW-2026-11-09.md` lists them with what was done. The behaviour
+that changed:
+
+- **§9, what decides the commands.** Whether the document loads
+  unicode-math, and nothing else: with a root, its preamble; without one, an
+  engine other than pdflatex, since `--verify`'s own snippet preamble for
+  lualatex and xelatex loads it. The engine (a fontspec document is lualatex)
+  and `unicode_input` no longer do; the amendment of 2026-11-09 tied the
+  preset to the mechanism, which gave a fontspec document `\symbf` it could
+  not compile. The mechanism follows the same test, and without
+  unicode-math it is unicode-math-input, which works under lualatex too
+  (measured).
+- **§9, the root.** `--root`, else the config's `root`, else, for a FILE
+  named on its own, the document itself or the main document a subfile
+  names (`\documentclass[../main.tex]{subfiles}`). The amendment of
+  2026-11-09 let a file's own `\documentclass` override the config's root.
+- **§12, unicode-math's glyphs.** `packages.tsv` gains a fourth column: for
+  a command that spells one character, whether lualatex with unicode-math
+  typesets the same glyphs for it as for the character, read off the boxes
+  with Lua. Four differ (`\backepsilon`, `\blacktriangleleft`,
+  `\blacktriangleright`, `\bullet`). Under the unicode-math preset such a
+  command is not written for the character (unicode-math's own name is),
+  and read back it means what unicode-math draws: its own character where
+  its table names one (`\blacktriangleright` is ▶), else no atom, so it is
+  left as written. A character with no curated spelling is written by its
+  unicode-math name under that preset.
+- **§12, the primes.** `′`, `″`, `‴` are spelled `'`, `''`, `'''`, in every
+  profile: under unicode-math-input and unicode-math the characters are the
+  superscript primes, measured identical to the apostrophes, while
+  `\prime` is the unraised glyph. `\prime`, `\dprime`, `\trprime` and
+  `\backprime` no longer read as those characters (a fourth column of
+  `latex.tsv`, names that are not aliases), and `‵` has no spelling. Under
+  the kernel mechanism the primes are undeclarable: a declared prime before
+  a script is a double superscript.
+- **§12, `defined.tsv`.** Generated with the package table: every
+  letters-only name the kernel defines, and every one amsmath, amsfonts,
+  amssymb, amsthm, mathtools, bm, bbm, mathrsfs and dsfont add, from
+  LuaTeX's hash. A `\providecommand` of a name the kernel or a loaded
+  package defines (without a root: the kernel, amsmath, amsfonts, amssymb),
+  or that the symbol table or the signatures know, did nothing and is
+  dropped.
+- **§12, blackboard and the lozenge.** With bbold or mathbbol loaded,
+  `bb_digit` and `bb_lower` are the `bb` command and `\Bbbk` is not used. `\blacklozenge`
+  is U+29EB, the black lozenge, not U+25C6.
+- **§9, scripts.** `\relax` and `\space` before a script are transparent.
+  The script test reads the end of a line without lexing it when the line
+  holds no `%`, which keeps a long line linear.
+- **§8, holes.** A hole's text keeps the space of a trailing control space
+  (`b\ `), both when trimmed for the form and when bound as a group's
+  contents; without it the rewrite escaped the brace that follows.
+- **§3, the reader.** One reading of the live text (comments, verbatim
+  environments including one opened and closed on one line, and the
+  arguments of `\verb` and `\lstinline` blanked) serves `is_document`, the
+  search for `\begin{document}` and the subfile main. Inside an imported
+  file a name resolves in the import path, then from the root's directory,
+  as TeX does. A name ending in `.tex` is not extended again.
+- **§11, `--verify`.** Every file the root reads is copied, as converted
+  where mathfmt converted it, under the files' common ancestor: a name
+  through `../` finds its file, a snippet root is compiled with its inputs,
+  and a subfile compiled alone has its main document. The snippet wrapper
+  is written as `mathfmt-snippet.tex`, so it never shadows a source. A
+  local class goes in place of `article` in the wrapper. A document that
+  reads a changed file outside its directory is no longer an error.
+- **Lint.** When a root is known, a conversion that writes a command the
+  preamble does not provide (a package it does not load, or under
+  unicode-math a name that package lacks) is a `package-not-loaded`
+  warning. A package mathfmt does not know the contents of may provide it.
+- **§14.** Fixtures `prime-is-apostrophe`, `structured-group-before-relax`,
+  `notation-hole-control-space`; the project case `bbold`; the
+  `unicode-math` case gains the shapes. Tests for the import fallback, live
+  text, the preamble deciding the commands, a root in force beating a
+  file's class, the lint, and a root compiled with everything it reads.
+  The flake's `verify` check gains bbold.
+- **Measured.** The table sweep, every symbol on its own page through
+  `--project --verify --declare`: 357 of 357 identical under
+  unicode-math-input in both profiles, under the kernel in the unicode
+  profile, and under unicode-math in the ascii profile; under the kernel in
+  the ascii profile 354 of 354 once the three primes are left out, and under
+  unicode-math in the unicode profile 348 of 348 once the nine amssymb names
+  unicode-math lacks are left out (an original spelled that way does not
+  compile there).
+- **Ruled on, not changed.** `\InputIfFileExists{x}{a}{b}` lists both
+  branches. `e^\alpha x` matched by `e^#1 x` writes `e^{{α}} x`, stable and
+  rendering the same. Five thousand nested braces still overflow the stack.

@@ -506,7 +506,7 @@ fn roots_are_chosen_as_the_spec_says() {
             ("sub/ch/one.tex", "$p \\ge q$\n"),
             ("verb.tex", "\\begin{verbatim}\n\\documentclass{article}\n\\end{verbatim}\n$\\alpha \\le 1$\n"),
             ("spaced.tex", "\\documentclass{article}\n\\begin {document}\n$\\alpha$\n\\end{document}\n"),
-            ("nobegin.tex", "\\documentclass{article}\n% \\begin{document}\n"),
+            ("nobegin.tex", "\\documentclass{article}\n% \\begin{document}\n$\\alpha$\n"),
         ],
     );
     let (code, out) = verify_in(
@@ -554,6 +554,55 @@ fn roots_are_chosen_as_the_spec_says() {
     assert!(
         out.contains("error: nobegin.tex:"),
         "a document with no live \\begin{{document}} is an error, not a pass:\n{out}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// What a root reads is compiled as converted wherever it lives: a snippet
+/// root's inputs, a file through `../`, and a section verified alone under a
+/// document whose class is a local file.
+#[test]
+fn a_root_is_compiled_with_everything_it_reads() {
+    if skip_without_tex("reads") {
+        return;
+    }
+    let dir = tree(
+        "reads",
+        &[
+            ("g/mathfmt.toml", "root = \"snip.tex\"\nprofile = \"ascii\"\n"),
+            ("g/snip.tex", "$x$ \\input{part}\n"),
+            ("g/part.tex", "$\\mathbb{1} + y$\n"),
+            ("c/doc/main.tex", "\\documentclass{article}\n\\begin{document}\n\\input{../shared/plain} $a \\le b$\n\\end{document}\n"),
+            ("c/shared/plain.tex", "Plain text.\n"),
+            ("k/mathfmt.toml", "root = \"main.tex\"\n"),
+            ("k/mypaper.cls", "\\NeedsTeXFormat{LaTeX2e}\\ProvidesClass{mypaper}\\LoadClass{article}\\RequirePackage{amssymb}\\newcommand{\\R}{\\mathbb{R}}\n"),
+            ("k/main.tex", "\\documentclass{mypaper}\n\\begin{document}\n\\input{sec}\n\\end{document}\n"),
+            ("k/sec.tex", "$x \\in \\R$\n"),
+        ],
+    );
+    let (code, out) = verify_in(&dir.join("g"), &["--project", "--verify"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("differs: snip.tex"),
+        "the repaired \\mathbb{{1}} in the input shows:\n{out}"
+    );
+    let (code, out) = verify_in(&dir.join("c/doc"), &["-p", "ascii", "--verify", "main.tex"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("unchanged: main.tex") || out.contains("verified: main.tex"),
+        "{out}"
+    );
+    let (code, out) = verify_in(&dir.join("c/doc"), &["--verify", "--declare", "main.tex"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("verified: main.tex (1 page identical)"),
+        "{out}"
+    );
+    let (code, out) = verify_in(&dir.join("k"), &["-p", "unicode", "--verify", "sec.tex"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("verified: sec.tex (1 page identical)"),
+        "{out}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

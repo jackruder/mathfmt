@@ -32,7 +32,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
 
-use mathfmt_core::project::{code_part, is_document};
+use mathfmt_core::project::{begin_document, is_document};
 use mathfmt_core::{Engine, Mechanism, Profile, Project};
 
 /// Left in a build directory mathfmt made, so that a later run with the
@@ -60,8 +60,6 @@ pub struct Source<'a> {
     pub profile: &'a Profile,
     /// The program to compile with: `pdflatex`, `lualatex`, `xelatex`, …
     pub program: String,
-    /// In project mode, the root this file was taken from.
-    pub project: Option<usize>,
     /// Named by the caller as a thing to verify: every FILE, or a project's
     /// root. A file that only came along as part of a project is not.
     pub is_root: bool,
@@ -358,51 +356,6 @@ fn check_tool(name: &str) -> Result<()> {
     }
 }
 
-/// The byte offset of the `\begin{document}` TeX will act on: outside a
-/// comment (`\\%` starts one, `\%` does not) and outside a verbatim
-/// environment, `\begin {document}` with a space included.
-fn begin_document(text: &str) -> Option<usize> {
-    let mut offset = 0;
-    let mut verbatim: Option<String> = None;
-    for line in text.split_inclusive('\n') {
-        let code = code_part(line);
-        if let Some(env) = &verbatim {
-            if code.contains(&format!("\\end{{{env}}}")) {
-                verbatim = None;
-            }
-            offset += line.len();
-            continue;
-        }
-        let mut from = 0;
-        while let Some(at) = code[from..].find("\\begin") {
-            let at = from + at;
-            let rest = code[at + 6..].trim_start();
-            if let Some(env) = rest.strip_prefix('{').and_then(|r| r.split('}').next()) {
-                if env == "document" {
-                    return Some(offset + at);
-                }
-                if matches!(
-                    env,
-                    "verbatim"
-                        | "verbatim*"
-                        | "Verbatim"
-                        | "lstlisting"
-                        | "minted"
-                        | "comment"
-                        | "filecontents"
-                        | "filecontents*"
-                ) {
-                    verbatim = Some(env.to_string());
-                    break;
-                }
-            }
-            from = at + 6;
-        }
-        offset += line.len();
-    }
-    None
-}
-
 /// Put `block` before the document's `\begin{document}`; `None` when the
 /// text has none.
 fn inject(text: &str, block: &str) -> Option<String> {
@@ -433,51 +386,80 @@ fn verify_root(
         .unwrap_or_else(|| PathBuf::from("."));
     let root_dir = std::fs::canonicalize(&root_dir)
         .with_context(|| format!("resolving {}", root_dir.display()))?;
-    // A document is compiled from a copy of its directory holding the
-    // sources that live there: its own project's, and any other source it
-    // reads (a file two roots share is converted once, by the first, and
-    // must still be the converted copy here). A source elsewhere is another
-    // document's, unless this one reads it: then the copy cannot hold it,
-    // and saying so beats comparing the original with itself.
-    let mut parts: Vec<(&Source<'_>, PathBuf)> = Vec::new();
-    let mut reads: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut include_dirs: Vec<PathBuf> = Vec::new();
-    if document {
-        if let Ok(project) = Project::read(&root.path) {
-            reads = project.files.iter().map(|f| canonical(f)).collect();
-            // `\include{sections/x}` writes `sections/x.aux` under the
-            // output directory, which TeX does not create; every file the
-            // document reads gets its directory there.
-            for f in &project.files {
-                if let Ok(rel) = relative_to(&root_dir, f) {
-                    if let Some(p) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        include_dirs.push(p.to_path_buf());
-                    }
-                }
-            }
+    // Both sides are compiled from a copy of every file the root reads
+    // (`\input`, `\include`, …), laid out under the files' common ancestor
+    // so that `..` in a name still finds its file; kpathsea does not search
+    // TEXINPUTS for a name that starts with `../`. A file mathfmt converted
+    // is copied as converted on the `b` side, whichever root converted it
+    // (two roots may share a file). Unlisted files (style files, figures)
+    // are found through TEXINPUTS in the root's own directory.
+    let mut reads: Vec<PathBuf> = Project::read(&root.path)
+        .map(|p| p.files.iter().map(|f| canonical(f)).collect())
+        .unwrap_or_default();
+    // A subfile compiled alone reads its main document's preamble.
+    if let Some(main) = mathfmt_core::project::subfile_main(root.original) {
+        let main = root_dir.join(main);
+        let main = if main.is_file() {
+            main
+        } else {
+            main.with_extension("tex")
+        };
+        if let Ok(p) = Project::read(&main) {
+            reads.extend(p.files.iter().map(|f| canonical(f)));
+            reads.extend(p.definitions.iter().map(|f| canonical(f)));
         }
-        for s in all
-            .iter()
-            .filter(|s| s.project == root.project || reads.contains(&canonical(&s.path)))
-        {
-            match relative_to(&root_dir, &s.path) {
-                Ok(rel) => parts.push((s, rel)),
-                Err(_) if s.original != s.converted && reads.contains(&canonical(&s.path)) => {
-                    bail!(
-                        "{} reads {} from outside its own directory; --verify compiles from a copy of that directory and cannot place the file in it",
-                        root.path.display(),
-                        s.path.display()
-                    );
-                }
-                Err(_) => {}
+    }
+    reads.sort();
+    reads.dedup();
+    let own = canonical(&root.path);
+    let source_of = |path: &Path| all.iter().find(|s| canonical(&s.path) == path);
+    let mut anchor = root_dir.clone();
+    for f in &reads {
+        while !f.starts_with(&anchor) {
+            if !anchor.pop() {
+                bail!(
+                    "{} and {} share no directory",
+                    root.path.display(),
+                    f.display()
+                );
             }
         }
     }
-    if root.original == root.converted
-        && (!document || parts.iter().all(|(s, _)| s.original == s.converted))
-    {
+    let root_rel_dir = root_dir
+        .strip_prefix(&anchor)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    // (relative path under the anchor, original bytes, converted bytes)
+    let mut copies: Vec<(PathBuf, Vec<u8>, Vec<u8>)> = Vec::new();
+    for f in reads.iter().filter(|f| **f != own) {
+        let rel = f
+            .strip_prefix(&anchor)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let (a, b) = match source_of(f) {
+            Some(s) => (
+                s.original.as_bytes().to_vec(),
+                s.converted.as_bytes().to_vec(),
+            ),
+            None => {
+                let bytes = std::fs::read(f).with_context(|| format!("reading {}", f.display()))?;
+                (bytes.clone(), bytes)
+            }
+        };
+        copies.push((rel, a, b));
+    }
+    if root.original == root.converted && copies.iter().all(|(_, a, b)| a == b) {
         return Ok((Verdict::Unchanged, 0));
     }
+    // `\include{sections/x}` writes `sections/x.aux` under the output
+    // directory, which TeX does not create; every file read below the
+    // root's directory gets its directory there.
+    let include_dirs: Vec<PathBuf> = reads
+        .iter()
+        .filter_map(|f| f.strip_prefix(&root_dir).ok())
+        .filter_map(|rel| rel.parent().filter(|p| !p.as_os_str().is_empty()))
+        .map(Path::to_path_buf)
+        .collect();
     let declare = root
         .declare
         .filter(|block| document && !block.trim().is_empty());
@@ -499,50 +481,45 @@ fn verify_root(
         .ok_or_else(|| anyhow!("{} has no file name", root.path.display()))?
         .to_os_string();
 
-    // Two build trees, `a` for the original and `b` for the converted, each
-    // with a copy of the sources at their relative paths and an output
-    // directory for the compile. Both compiles run from their copy and see
-    // the root's directory through TEXINPUTS, so unlisted files (style
-    // files, figures, other inputs) are shared.
+    // Two build trees, `a` for the original and `b` for the converted,
+    // each with the copy and an output directory. Both compiles run from
+    // the root's place in their copy.
     let mut jobs = Vec::new();
     for (side, converted) in [("a", false), ("b", true)] {
         let src_dir = dir.join(side).join("src");
         let out_dir = dir.join(side).join("out");
-        std::fs::create_dir_all(&src_dir)?;
+        let work = src_dir.join(&root_rel_dir);
+        std::fs::create_dir_all(&work)?;
         std::fs::create_dir_all(&out_dir)?;
         for d in &include_dirs {
             std::fs::create_dir_all(out_dir.join(d))?;
         }
-        let job_name = if document {
-            for (s, rel) in &parts {
-                let text = if converted { s.converted } else { s.original };
-                let injected = match declare {
-                    Some(block) if std::ptr::eq(*s, root) => inject(text, block),
-                    _ => None,
-                };
-                let text = injected.as_deref().unwrap_or(text);
-                let target = src_dir.join(rel);
-                if let Some(p) = target.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                if let Some(p) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(out_dir.join(p))?;
-                }
-                std::fs::write(&target, text)
-                    .with_context(|| format!("writing {}", target.display()))?;
+        for (rel, a, b) in &copies {
+            let target = src_dir.join(rel);
+            if let Some(p) = target.parent() {
+                std::fs::create_dir_all(p)?;
             }
+            std::fs::write(&target, if converted { b } else { a })
+                .with_context(|| format!("writing {}", target.display()))?;
+        }
+        let text = if converted {
+            root.converted
+        } else {
+            root.original
+        };
+        let job_name = if document {
+            let injected = declare.and_then(|block| inject(text, block));
+            let target = work.join(&root_name);
+            std::fs::write(&target, injected.as_deref().unwrap_or(text))
+                .with_context(|| format!("writing {}", target.display()))?;
             PathBuf::from(&root_name)
         } else {
-            let text = if converted {
-                root.converted
-            } else {
-                root.original
-            };
-            let wrapped = wrap_snippet(root, text, opts)?;
-            std::fs::write(src_dir.join("snippet.tex"), wrapped)?;
-            PathBuf::from("snippet.tex")
+            // A name no source has, so the wrapper never shadows a file.
+            let job = PathBuf::from("mathfmt-snippet.tex");
+            std::fs::write(work.join(&job), wrap_snippet(root, text, opts)?)?;
+            job
         };
-        jobs.push((src_dir, out_dir, job_name));
+        jobs.push((work, out_dir, job_name));
     }
 
     let mut pdfs = Vec::new();
@@ -597,20 +574,6 @@ fn verify_root(
         },
         declared,
     ))
-}
-
-fn relative_to(root_dir: &Path, path: &Path) -> Result<PathBuf> {
-    let abs =
-        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
-    abs.strip_prefix(root_dir)
-        .map(Path::to_path_buf)
-        .map_err(|_| {
-            anyhow!(
-                "{} is not under {}, the document's directory; --verify compiles from there",
-                path.display(),
-                root_dir.display()
-            )
-        })
 }
 
 /// Compile `job` in `src_dir`, writing to `out_dir`. `Ok(Err(excerpt))` is a
@@ -700,7 +663,29 @@ fn wrap_snippet(root: &Source<'_>, text: &str, opts: &Options) -> Result<String>
                 out.push('\n');
             }
         }
-        None => out.push_str(builtin_preamble(&root.program)?),
+        None => {
+            // A document's own local class goes in place of `article`, so the
+            // definitions it makes are in force; it cannot be loaded twice.
+            let preamble = builtin_preamble(&root.program)?;
+            let local_class = root.engine.project.as_ref().and_then(|p| {
+                let class = p.class.as_deref()?;
+                p.definitions
+                    .iter()
+                    .any(|d| {
+                        d.file_name()
+                            .is_some_and(|n| n == format!("{class}.cls").as_str())
+                    })
+                    .then(|| class.to_string())
+            });
+            match local_class {
+                Some(class) => out.push_str(&preamble.replacen(
+                    "\\documentclass{article}",
+                    &format!("\\documentclass{{{class}}}"),
+                    1,
+                )),
+                None => out.push_str(preamble),
+            }
+        }
     }
     // Lines holding a preamble-only command move up whole; both sides are
     // treated alike, so the move cannot hide a difference.
@@ -718,12 +703,17 @@ fn wrap_snippet(root: &Source<'_>, text: &str, opts: &Options) -> Result<String>
     // the project's local packages and preamble inputs, the config's macro
     // files, the command line's.
     let config_dir = root.engine.config.dir.clone();
+    // A local class is the document's own and cannot be loaded a second
+    // time under the wrapper's `article`.
     let project_files: Vec<PathBuf> = root
         .engine
         .project
         .as_ref()
         .map(|p| p.definitions.clone())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| !f.extension().is_some_and(|e| e == "cls"))
+        .collect();
     let macro_files = project_files
         .into_iter()
         .chain(root.engine.config.macros.iter().map(|m| match &config_dir {
@@ -1008,7 +998,7 @@ mod tests {
         assert!(!is_document("$\\alpha$ % unlike a \\documentclass line\n"));
         assert!(is_document("\\documentclass{article} % the class\n"));
         assert!(is_document("50\\% of \\documentclass{article}\n"));
-        assert_eq!(code_part("a \\% b % c"), "a \\% b ");
+        assert_eq!(mathfmt_core::project::code_part("a \\% b % c"), "a \\% b ");
     }
 
     #[test]
