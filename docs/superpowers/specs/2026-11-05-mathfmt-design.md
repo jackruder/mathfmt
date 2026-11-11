@@ -1118,8 +1118,9 @@ that changed:
   ARM, macOS Intel and Apple, Windows x64, and an sdist; each native wheel
   is installed and run. A `v*` tag publishes to PyPI by trusted publishing,
   which needs the PyPI project to name the repository, the workflow and the
-  `pypi` environment first. The workflow passes `actionlint`; it has not
-  yet run on GitHub.
+  `pypi` environment first. Its first run on GitHub, on `f7d3508`, built
+  and ran every wheel but Apple silicon, whose runner label `macos-14` is
+  retired; that job runs on `macos-15` now.
 - **pre-commit without Rust.** A `repo: local` hook with
   `language: python` and `additional_dependencies: ["mathfmt-tex==…"]`:
   pre-commit installs the wheel into its own environment. A hook repo with
